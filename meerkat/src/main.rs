@@ -72,15 +72,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<String, String>) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new();
 
-    // Load services
-    for stmt in &prog {
-        if let Stmt::Service { name, decls } = stmt {
-            manager.create_service(name.clone(), decls.clone()).await
-                .map_err(|e| format!("Service error: {}", e))?;
-            println!("Service '{}' loaded", name);
-        }
-    }
-
     // Start network actor as server
     let mut net = NetworkActor::new(NodeType::Server).await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -118,6 +109,16 @@ async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<S
 
     // Wire network into manager so server can also do remote lookups
     manager.network = Some(net);
+
+    // Load services after network and remote services are ready,
+    // so that remote lookups during service initialization work correctly
+    for stmt in &prog {
+        if let Stmt::Service { name, decls } = stmt {
+            manager.create_service(name.clone(), decls.clone()).await
+                .map_err(|e| format!("Service error: {}", e))?;
+            println!("Service '{}' loaded", name);
+        }
+    }
 
     println!("Server running, press Ctrl+C to stop...");
 
