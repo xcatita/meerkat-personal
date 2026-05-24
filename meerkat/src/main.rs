@@ -26,6 +26,10 @@ struct Args {
     /// Remote service URLs: -i <url> maps the service slug to a remote address
     #[arg(short = 'i', long = "import-url")]
     import_urls: Vec<String>,
+
+    /// Port to listen on in server mode (default: 9000)
+    #[arg(short = 'p', long = "port", default_value_t = 9000)]
+    port: u16,
 }
 
 #[tokio::main]
@@ -55,7 +59,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 .map_err(|e| format!("Parse error: {}", e))?;
 
             if args.server {
-                run_server(prog, remote_url_map).await
+                run_server(prog, remote_url_map, args.port).await
             } else {
                 run_client(prog, file, remote_url_map).await
             }
@@ -69,7 +73,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<String, String>) -> Result<(), Box<dyn Error>> {
+async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<String, String>, port: u16) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new();
 
     // Start network actor as server
@@ -78,7 +82,7 @@ async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<S
 
     // Listen
     let public_ip = meerkat_lib::runtime::Manager::get_public_ip();
-    let listen_addr = Address::new("/ip4/0.0.0.0/tcp/9000");
+    let listen_addr = Address::new(&format!("/ip4/0.0.0.0/tcp/{}", port));
     let reply = net.handle_command(NetworkCommand::Listen { addr: listen_addr }).await;
     let actual_addr = match reply {
         meerkat_lib::net::NetworkReply::ListenSuccess { addr } => addr,
