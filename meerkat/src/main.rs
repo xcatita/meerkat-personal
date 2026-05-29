@@ -34,6 +34,10 @@ struct Args {
     /// Bind to loopback/localhost only (force 127.0.0.1 instead of public IP)
     #[arg(long = "local", default_value_t = false)]
     local: bool,
+
+    /// Perform static checks and terminate immediately
+    #[arg(long = "check", default_value_t = false)]
+    check_only: bool,
 }
 
 #[tokio::main]
@@ -62,6 +66,11 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         Some(ref file) => {
             let prog = meerkat_lib::runtime::parser::parser::parse_file(file)
                 .map_err(|e| format!("Parse error: {}", e))?;
+
+            if args.check_only {
+                // TODO: Insert static checks here
+                return Ok(());
+            }
 
             if args.server {
                 run_server(prog, remote_url_map, args.port, args.local).await
