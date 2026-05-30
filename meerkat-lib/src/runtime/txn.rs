@@ -110,6 +110,20 @@ impl VarLock {
         }
     }
 
+    /// Upgrade a read lock held solely by txn_id to a write lock.
+    /// Needed for read-then-write patterns (e.g. x = x + 1).
+    /// Returns true if upgrade succeeded or var is already write-locked by txn_id.
+    pub fn upgrade_to_write(&mut self, txn_id: &TxnId) -> bool {
+        match self {
+            VarLock::ReadLocked(set) if set.len() == 1 && set.contains(txn_id) => {
+                *self = VarLock::WriteLocked(txn_id.clone());
+                true
+            }
+            VarLock::WriteLocked(tid) if tid == txn_id => true,
+            _ => false,
+        }
+    }
+
     /// Release any lock (read or write) held by txn_id.
     pub fn release(&mut self, txn_id: &TxnId) {
         match self {
