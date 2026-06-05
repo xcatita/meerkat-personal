@@ -37,7 +37,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
           rustup default stable
 
       - name: Cache Rust dependencies
@@ -54,6 +54,9 @@ jobs:
       # TODO: Re-enable after existing Clippy warnings are fixed.
       # - name: Run Clippy
       #   run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check WASM build
+        run: cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
 
       - name: Run tests
         run: cargo test --locked --workspace --all-features

@@ -52,6 +52,13 @@ repos:
       #   types: [rust]
       #   pass_filenames: false
 
+      - id: cargo-check-wasm
+        name: cargo check wasm
+        entry: cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
+        language: system
+        files: ^(Cargo\.toml|Cargo\.lock|meerkat-lib/Cargo\.toml|meerkat-lib/.*\.(rs|lalrpop))$
+        pass_filenames: false
+
       - id: cargo-test
         name: cargo test
         entry: cargo test --locked --workspace --all-features
