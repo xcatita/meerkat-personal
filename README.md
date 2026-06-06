@@ -30,7 +30,7 @@ cargo build
 cargo test
 
 # Test WASM compatibility
-cargo check -p meerkat-lib --target wasm32-unknown-unknown --all-features
+cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
 
 # Run the REPL
 cargo run
