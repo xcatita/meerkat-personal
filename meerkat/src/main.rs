@@ -86,7 +86,7 @@ async fn run_server(
     port: u16,
     local: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let mut net = NetworkActor::new(NodeType::Regular);
+    let mut net = NetworkActor::new(NodeType::Regular).await?;
     let mut manager = Manager::new();
 
     let node_ip = manager.get_node_ip();
