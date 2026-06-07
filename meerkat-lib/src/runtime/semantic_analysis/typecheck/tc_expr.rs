@@ -182,22 +182,27 @@ impl TypecheckEnv {
             }
 
             // more todo on Action type - typecheck not yet implemented
-            Expr::Action(_stmts) => {
-                Action
-            }
+            Expr::Action(_stmts) => Action,
             Expr::MemberAccess { .. } => {
                 // TODO: typecheck member access across services
                 self.gen_typevar()
             }
-            Expr::Select { table_name, column_names, where_clause } => {
+            Expr::Select {
+                table_name,
+                column_names,
+                where_clause,
+            } => {
                 let schema = {
-                    let table_type = self.var_context.get(table_name);    // check if table exists and extract schema
+                    let table_type = self.var_context.get(table_name); // check if table exists and extract schema
                     match table_type {
                         Some(Type::Table(fields)) => fields.clone(),
-                        _ => panic!("Table {} for selection not found or not a table type", table_name),
+                        _ => panic!(
+                            "Table {} for selection not found or not a table type",
+                            table_name
+                        ),
                     }
                 };
-                let field_names: Vec<_> = schema.iter().map(|field| field.name.clone()).collect();   // get column names and check if columns to be selected exist
+                let field_names: Vec<_> = schema.iter().map(|field| field.name.clone()).collect(); // get column names and check if columns to be selected exist
                 for column_name in column_names {
                     if !field_names.contains(column_name) {
                         panic!("{} field not found in table {}", column_name, table_name);
@@ -205,15 +210,20 @@ impl TypecheckEnv {
                 }
 
                 let cond_type = self.infer_expr(where_clause);
-                
+
                 if cond_type != Type::Bool {
                     panic!("Select where clause must be boolean, got {}", cond_type);
                 }
-                Type::Table(schema)    
+                Type::Table(schema)
             }
 
-            Expr::Table {schema, records } => Table(schema.to_vec()),
-            Expr::Fold { table_name, column_name, operation, identity } => {
+            Expr::Table { schema, records } => Table(schema.to_vec()),
+            Expr::Fold {
+                table_name,
+                column_name,
+                operation,
+                identity,
+            } => {
                 // Look up table and resolve column type from AST fields
                 let column_type = {
                     let table_type = self.var_context.get(table_name);
@@ -226,7 +236,10 @@ impl TypecheckEnv {
                                     DataType::Number => Type::Int,
                                     DataType::String => Type::String,
                                 },
-                                None => panic!("Column {} not found in table {}", column_name, table_name),
+                                None => panic!(
+                                    "Column {} not found in table {}",
+                                    column_name, table_name
+                                ),
                             }
                         }
                         _ => panic!("Table {} not found or not a table type", table_name),
@@ -244,14 +257,13 @@ impl TypecheckEnv {
                                 panic!("Column type should match function argument type, expected {}, got {}", &param, &column_type);
                             }
                         }
-                    },
-                    _ => panic!("Second argument must be function type")
+                    }
+                    _ => panic!("Second argument must be function type"),
                 }
                 self.find(&accum_type)
-            },
-}
-
-}
+            }
+        }
+    }
 }
 
 // TODO List

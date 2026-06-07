@@ -1,12 +1,12 @@
+use super::ast::{ActionStmt, Decl, Expr, Value};
+use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
+use super::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
+use crate::net::network_layer::NetworkLayer;
+use crate::net::{Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, ServiceId};
+use crate::runtime::txn::{Transaction, TxnId, VarState};
 use std::collections::{HashMap, HashSet};
-use crate::runtime::txn::{TxnId, VarState, Transaction};
 use tokio::sync::oneshot;
 use tokio::time::Duration;
-use super::ast::{Value, Decl, Expr, ActionStmt};
-use super::interpreter::{eval, EvalContext, EvalError, execute, ExecuteEffect};
-use super::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
-use crate::net::{Address, ServiceId, NetworkCommand, NetworkEvent, MeerkatMessage, NetworkActor};
-use crate::net::network_layer::NetworkLayer;
 
 pub struct Service {
     /// Globally unique identity of this service (address-based when networked).
@@ -14,8 +14,8 @@ pub struct Service {
     pub name: String,
     /// Per-variable state: value, lock, and latest write transaction in one place
     pub vars: HashMap<String, VarState>,
-    pub defs: HashMap<String, Expr>,    // original def expressions for re-evaluation
-    pub dep: DependAnalysis,            // dependency graph + topo order
+    pub defs: HashMap<String, Expr>, // original def expressions for re-evaluation
+    pub dep: DependAnalysis,         // dependency graph + topo order
 }
 
 pub struct Manager {
@@ -72,9 +72,11 @@ impl Manager {
         }
     }
 
-    pub async fn create_service(&mut self, name: String, decls: Vec<Decl>)
-        -> Result<(), EvalError>
-    {
+    pub async fn create_service(
+        &mut self,
+        name: String,
+        decls: Vec<Decl>,
+    ) -> Result<(), EvalError> {
         let dep = calc_dep_srv(&decls);
 
         let id = self.service_identity(&name);
@@ -92,15 +94,33 @@ impl Manager {
         for decl in decls {
             match decl {
                 Decl::VarDecl { name, val } => {
-                    let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name, txn: None }).await?;
+                    let value = eval(
+                        &val,
+                        &env,
+                        &mut EvalContext {
+                            manager: self,
+                            service_name: &svc_name,
+                            txn: None,
+                        },
+                    )
+                    .await?;
                     env.push((name.clone(), value.clone()));
                     service.vars.insert(name, VarState::new(value));
                 }
                 Decl::DefDecl { name, val, .. } => {
-                    let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name, txn: None }).await?;
+                    let value = eval(
+                        &val,
+                        &env,
+                        &mut EvalContext {
+                            manager: self,
+                            service_name: &svc_name,
+                            txn: None,
+                        },
+                    )
+                    .await?;
                     env.push((name.clone(), value.clone()));
                     service.vars.insert(name.clone(), VarState::new(value));
-                    service.defs.insert(name, val);  // store original expr
+                    service.defs.insert(name, val); // store original expr
                 }
                 Decl::TableDecl { .. } => {
                     return Err(EvalError::NotImplemented);
@@ -112,7 +132,12 @@ impl Manager {
         Ok(())
     }
 
-    pub async fn lookup(&mut self, ident: &str, service_name: &str, mut txn: Option<&mut Transaction>) -> Result<Value, EvalError> {
+    pub async fn lookup(
+        &mut self,
+        ident: &str,
+        service_name: &str,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<Value, EvalError> {
         // Check if service is remote
         if self.remote_services.contains_key(service_name) {
             return self.remote_lookup(service_name, ident, txn).await;
@@ -120,7 +145,9 @@ impl Manager {
 
         // If it's a def, re-evaluate from stored expression for freshness.
         // The transaction flows through so the def's underlying vars are locked.
-        let def_expr = self.services.get(service_name)
+        let def_expr = self
+            .services
+            .get(service_name)
             .and_then(|s| s.defs.get(ident))
             .cloned();
 
@@ -129,7 +156,16 @@ impl Manager {
             // through lookup (acquiring read locks and populating the cache)
             // rather than being pre-seeded from current service var values.
             let env: Vec<(String, Value)> = Vec::new();
-            return eval(&expr, &env, &mut EvalContext { manager: self, service_name, txn: txn.as_deref_mut() }).await;
+            return eval(
+                &expr,
+                &env,
+                &mut EvalContext {
+                    manager: self,
+                    service_name,
+                    txn: txn.as_deref_mut(),
+                },
+            )
+            .await;
         }
 
         // Local var read. If inside a transaction, return the cached value if
@@ -163,20 +199,36 @@ impl Manager {
                 return Ok(value);
             }
         }
-        Err(EvalError::LookupError(format!("Variable '{}' not found in service '{}'", ident, service_name)))
+        Err(EvalError::LookupError(format!(
+            "Variable '{}' not found in service '{}'",
+            ident, service_name
+        )))
     }
 
-    pub async fn assign(&mut self, service_name: &str, var: &str, value: Value, mut txn: Option<&mut Transaction>) -> Result<(), EvalError> {
+    pub async fn assign(
+        &mut self,
+        service_name: &str,
+        var: &str,
+        value: Value,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<(), EvalError> {
         // Inside a transaction: acquire the write lock lazily (upgrading from a
         // read lock for read-then-write patterns like x = x + 1) and buffer the
         // write. The buffered value is applied to the service only at commit, so
         // a transaction that fails partway leaves no partial writes behind.
         if txn.is_some() {
             let key = (self.id_for_service(service_name), var.to_string());
-            enum LockAction { Acquire, Upgrade }
+            enum LockAction {
+                Acquire,
+                Upgrade,
+            }
             let (txn_id, kind) = {
                 let t = txn.as_deref().unwrap();
-                let kind = if t.locked.contains(&key) { LockAction::Upgrade } else { LockAction::Acquire };
+                let kind = if t.locked.contains(&key) {
+                    LockAction::Upgrade
+                } else {
+                    LockAction::Acquire
+                };
                 (t.id.clone(), kind)
             };
             match kind {
@@ -197,10 +249,16 @@ impl Manager {
             if let Some(var_state) = service.vars.get_mut(var) {
                 var_state.value = value;
             } else {
-                return Err(EvalError::LookupError(format!("Variable '{}' not found in service '{}'", var, service_name)));
+                return Err(EvalError::LookupError(format!(
+                    "Variable '{}' not found in service '{}'",
+                    var, service_name
+                )));
             }
         } else {
-            return Err(EvalError::LookupError(format!("Service '{}' not found", service_name)));
+            return Err(EvalError::LookupError(format!(
+                "Service '{}' not found",
+                service_name
+            )));
         }
 
         // propagate: re-evaluate defs that depend on this var in topo order
@@ -210,37 +268,57 @@ impl Manager {
 
     async fn propagate(&mut self, service_name: &str, changed_var: &str) {
         // collect defs that need re-evaluation in topo order
-        let topo_order: Vec<String> = self.services
+        let topo_order: Vec<String> = self
+            .services
             .get(service_name)
             .map(|s| s.dep.topo_order.clone())
             .unwrap_or_default();
 
         for def_name in topo_order {
-            let needs_update = self.services
+            let needs_update = self
+                .services
                 .get(service_name)
                 .and_then(|s| s.dep.dep_vars.get(&def_name))
                 .map(|dep_vars| dep_vars.contains(changed_var))
                 .unwrap_or(false);
 
-            let is_def = self.services
+            let is_def = self
+                .services
                 .get(service_name)
                 .map(|s| s.defs.contains_key(&def_name))
                 .unwrap_or(false);
 
             if needs_update && is_def {
                 // build env from current var values
-                let expr = self.services
+                let expr = self
+                    .services
                     .get(service_name)
                     .and_then(|s| s.defs.get(&def_name))
                     .cloned();
 
                 if let Some(expr) = expr {
-                    let env: Vec<(String, Value)> = self.services
+                    let env: Vec<(String, Value)> = self
+                        .services
                         .get(service_name)
-                        .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect())
+                        .map(|s| {
+                            s.vars
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.value.clone()))
+                                .collect()
+                        })
                         .unwrap_or_default();
 
-                    let value = match eval(&expr, &env, &mut EvalContext { manager: self, service_name, txn: None }).await {
+                    let value = match eval(
+                        &expr,
+                        &env,
+                        &mut EvalContext {
+                            manager: self,
+                            service_name,
+                            txn: None,
+                        },
+                    )
+                    .await
+                    {
                         Ok(v) => v,
                         Err(e) => {
                             // Propagation is best-effort; durable retry of failed
@@ -259,7 +337,6 @@ impl Manager {
             }
         }
     }
-
 
     /// Drain all pending network events and dispatch each to the matching
     /// oneshot channel in pending_replies. Non-matching events are dropped.
@@ -302,9 +379,12 @@ impl Manager {
         timeout_msg: String,
     ) -> Result<MeerkatMessage, EvalError> {
         // Send the message
-        let net = self.network.as_mut()
+        let net = self
+            .network
+            .as_mut()
             .ok_or_else(|| EvalError::NetworkError("No network layer available".to_string()))?;
-        net.handle_command(NetworkCommand::SendMessage { addr, msg }).await;
+        net.handle_command(NetworkCommand::SendMessage { addr, msg })
+            .await;
 
         // Register oneshot channel for this request
         let (tx, mut rx) = oneshot::channel::<MeerkatMessage>();
@@ -337,8 +417,9 @@ impl Manager {
 
     /// Get the network address for a remote service (strips the slug)
     fn remote_addr(&self, service: &str) -> Result<Address, EvalError> {
-        let full_url = self.remote_services.get(service)
-            .ok_or_else(|| EvalError::LookupError(format!("Remote service '{}' not found", service)))?;
+        let full_url = self.remote_services.get(service).ok_or_else(|| {
+            EvalError::LookupError(format!("Remote service '{}' not found", service))
+        })?;
         let addr_str = full_url.0.trim_end_matches(&format!("/{}", service));
         Ok(Address::new(addr_str))
     }
@@ -359,7 +440,8 @@ impl Manager {
         match reply {
             crate::net::NetworkReply::LocalAddresses { addrs } => {
                 if let Some(addr) = addrs.first() {
-                    let addr_str = addr.0
+                    let addr_str = addr
+                        .0
                         .replace("0.0.0.0", &public_ip)
                         .replace("127.0.0.1", &public_ip);
                     format!("{}/p2p/{}", addr_str, peer_id)
@@ -375,9 +457,9 @@ impl Manager {
     /// RandomState is OS-seeded on native targets; combining it with the current
     /// time gives a value that is distinct across nodes with high probability.
     fn random_node_id() -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
+        use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -391,20 +473,30 @@ impl Manager {
     pub fn get_public_ip() -> String {
         use std::net::UdpSocket;
         UdpSocket::bind("0.0.0.0:0")
-            .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
+            .and_then(|s| {
+                s.connect("8.8.8.8:80")?;
+                s.local_addr()
+            })
             .map(|addr| addr.ip().to_string())
             .unwrap_or_else(|_| "127.0.0.1".to_string())
     }
 
-    pub async fn remote_lookup(&mut self, service: &str, member: &str, mut txn: Option<&mut Transaction>) -> Result<Value, EvalError> {
+    pub async fn remote_lookup(
+        &mut self,
+        service: &str,
+        member: &str,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<Value, EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
         // The remote service's advertised URL is its ServiceId; key this
         // transaction's read cache and lock tracking by (that id, member).
         let remote_sid = ServiceId::new(
-            self.remote_services.get(service).map(|a| a.0.clone())
-                .unwrap_or_else(|| service.to_string())
+            self.remote_services
+                .get(service)
+                .map(|a| a.0.clone())
+                .unwrap_or_else(|| service.to_string()),
         );
         let key = (remote_sid, member.to_string());
 
@@ -437,10 +529,17 @@ impl Manager {
             txn_id: shared_tid,
         };
 
-        let reply = self.send_and_await_reply(
-            addr, msg, request_id,
-            format!("Timeout waiting for remote lookup of {}.{}", service, member),
-        ).await?;
+        let reply = self
+            .send_and_await_reply(
+                addr,
+                msg,
+                request_id,
+                format!(
+                    "Timeout waiting for remote lookup of {}.{}",
+                    service, member
+                ),
+            )
+            .await?;
 
         match reply {
             MeerkatMessage::LookupResponse { value, .. } => {
@@ -451,10 +550,10 @@ impl Manager {
                 }
                 Ok(val)
             }
-            MeerkatMessage::LookupError { error, .. } => {
-                Err(EvalError::LookupError(error))
-            }
-            _ => Err(EvalError::NetworkError("Unexpected reply to lookup request".to_string())),
+            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LookupError(error)),
+            _ => Err(EvalError::NetworkError(
+                "Unexpected reply to lookup request".to_string(),
+            )),
         }
     }
 
@@ -462,8 +561,15 @@ impl Manager {
     /// holding a read lock on the member under the shared transaction id (kept
     /// in pending_txns until commit/abort), accumulating into any state this
     /// node already prepared for the same transaction.
-    pub async fn remote_read_participant(&mut self, service: &str, member: &str, tid: TxnId) -> Result<Value, EvalError> {
-        let mut txn = self.pending_txns.remove(&tid)
+    pub async fn remote_read_participant(
+        &mut self,
+        service: &str,
+        member: &str,
+        tid: TxnId,
+    ) -> Result<Value, EvalError> {
+        let mut txn = self
+            .pending_txns
+            .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
         match self.lookup(member, service, Some(&mut txn)).await {
             Ok(v) => {
@@ -479,7 +585,13 @@ impl Manager {
         }
     }
 
-    pub async fn remote_action(&mut self, service_id: &ServiceId, stmts: Vec<ActionStmt>, env: Vec<(String, Value)>, mut txn: Option<&mut Transaction>) -> Result<(), EvalError> {
+    pub async fn remote_action(
+        &mut self,
+        service_id: &ServiceId,
+        stmts: Vec<ActionStmt>,
+        env: Vec<(String, Value)>,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -515,10 +627,14 @@ impl Manager {
             txn_id: shared_tid,
         };
 
-        let reply = self.send_and_await_reply(
-            addr.clone(), msg, request_id,
-            format!("Timeout waiting for remote action on service '{}'", slug),
-        ).await?;
+        let reply = self
+            .send_and_await_reply(
+                addr.clone(),
+                msg,
+                request_id,
+                format!("Timeout waiting for remote action on service '{}'", slug),
+            )
+            .await?;
 
         match reply {
             MeerkatMessage::ActionResponse { success, error, .. } => {
@@ -527,11 +643,13 @@ impl Manager {
                     Ok(())
                 } else {
                     Err(EvalError::NetworkError(
-                        error.unwrap_or_else(|| "Remote action failed".to_string())
+                        error.unwrap_or_else(|| "Remote action failed".to_string()),
                     ))
                 }
             }
-            _ => Err(EvalError::NetworkError("Unexpected reply to action request".to_string())),
+            _ => Err(EvalError::NetworkError(
+                "Unexpected reply to action request".to_string(),
+            )),
         }
     }
 
@@ -542,7 +660,8 @@ impl Manager {
     /// not used for genuine remote services, whose identities travel embedded in
     /// their ActionClosures.
     pub fn id_for_service(&self, service_name: &str) -> ServiceId {
-        self.services.get(service_name)
+        self.services
+            .get(service_name)
             .map(|s| s.id.clone())
             .unwrap_or_else(|| ServiceId::new(service_name))
     }
@@ -554,7 +673,10 @@ impl Manager {
 
     /// Find the in-scope name of a local service from its ServiceId.
     pub fn name_for_id(&self, id: &ServiceId) -> Option<String> {
-        self.services.iter().find(|(_, s)| &s.id == id).map(|(n, _)| n.clone())
+        self.services
+            .iter()
+            .find(|(_, s)| &s.id == id)
+            .map(|(n, _)| n.clone())
     }
 
     /// Split a service identity into the dialable node address and the service
@@ -570,48 +692,75 @@ impl Manager {
 
     /// Try to acquire a write lock on a service variable.
     /// Returns LockConflict if the variable is already locked.
-    fn acquire_write_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
-        let service = self.services.get_mut(service_name)
-            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
-        let var_state = service.vars.get_mut(var)
+    fn acquire_write_lock(
+        &mut self,
+        service_name: &str,
+        var: &str,
+        txn_id: &TxnId,
+    ) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name).ok_or_else(|| {
+            EvalError::LookupError(format!("Service '{}' not found", service_name))
+        })?;
+        let var_state = service
+            .vars
+            .get_mut(var)
             .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
         if var_state.lock.try_write(txn_id) {
             Ok(())
         } else {
             Err(EvalError::LockConflict(format!(
-                "Variable '{}' is already locked; cannot acquire write lock", var
+                "Variable '{}' is already locked; cannot acquire write lock",
+                var
             )))
         }
     }
 
     /// Try to acquire a read lock on a service variable.
     /// Returns LockConflict if a write lock is held.
-    fn acquire_read_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
-        let service = self.services.get_mut(service_name)
-            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
-        let var_state = service.vars.get_mut(var)
+    fn acquire_read_lock(
+        &mut self,
+        service_name: &str,
+        var: &str,
+        txn_id: &TxnId,
+    ) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name).ok_or_else(|| {
+            EvalError::LookupError(format!("Service '{}' not found", service_name))
+        })?;
+        let var_state = service
+            .vars
+            .get_mut(var)
             .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
         if var_state.lock.try_read(txn_id) {
             Ok(())
         } else {
             Err(EvalError::LockConflict(format!(
-                "Variable '{}' is write-locked by another transaction", var
+                "Variable '{}' is write-locked by another transaction",
+                var
             )))
         }
     }
 
     /// Upgrade a read lock to a write lock on a service variable.
     /// Used for read-then-write within the same transaction (e.g. x = x + 1).
-    fn upgrade_to_write_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
-        let service = self.services.get_mut(service_name)
-            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
-        let var_state = service.vars.get_mut(var)
+    fn upgrade_to_write_lock(
+        &mut self,
+        service_name: &str,
+        var: &str,
+        txn_id: &TxnId,
+    ) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name).ok_or_else(|| {
+            EvalError::LookupError(format!("Service '{}' not found", service_name))
+        })?;
+        let var_state = service
+            .vars
+            .get_mut(var)
             .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
         if var_state.lock.upgrade_to_write(txn_id) {
             Ok(())
         } else {
             Err(EvalError::LockConflict(format!(
-                "Variable '{}' cannot be upgraded to a write lock; held by another transaction", var
+                "Variable '{}' cannot be upgraded to a write lock; held by another transaction",
+                var
             )))
         }
     }
@@ -659,7 +808,10 @@ impl Manager {
             match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
                 Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
                 Ok(_) => {}
-                Err(e) => { exec_error = Some(e); break; }
+                Err(e) => {
+                    exec_error = Some(e);
+                    break;
+                }
             }
         }
 
@@ -695,7 +847,9 @@ impl Manager {
     /// Infallible: once we are applying writes the transaction is committed, so
     /// there is no going back. Propagation is best-effort (retries: issue #24).
     async fn apply_committed_writes(&mut self, txn: &Transaction) {
-        let writes: Vec<((ServiceId, String), Value)> = txn.written.iter()
+        let writes: Vec<((ServiceId, String), Value)> = txn
+            .written
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let txn_id = txn.id.clone();
@@ -730,7 +884,9 @@ impl Manager {
         // one host, or transitive re-entry); otherwise start fresh. Pulling it
         // out of pending_txns gives ownership so we can borrow &mut self below,
         // and lets repeated actions accumulate into one prepared state.
-        let mut txn = self.pending_txns.remove(&tid)
+        let mut txn = self
+            .pending_txns
+            .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
         let mut env: Vec<(String, Value)> = initial_env.to_vec();
         let mut exec_error: Option<EvalError> = None;
@@ -738,7 +894,10 @@ impl Manager {
             match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
                 Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
                 Ok(_) => {}
-                Err(e) => { exec_error = Some(e); break; }
+                Err(e) => {
+                    exec_error = Some(e);
+                    break;
+                }
             }
         }
         if let Some(e) = exec_error {
@@ -768,7 +927,10 @@ impl Manager {
                     forward_err = Some(e);
                 }
             }
-            match forward_err { Some(e) => Err(e), None => Ok(()) }
+            match forward_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         } else {
             Ok(())
         }
@@ -791,17 +953,32 @@ impl Manager {
         static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
         let request_id = NEXT_COMMIT_ID.fetch_add(1, Ordering::SeqCst);
         let reply_to = self.local_reply_addr().await;
-        let msg = MeerkatMessage::Commit { request_id, txn_id: tid.clone(), reply_to };
-        let reply = self.send_and_await_reply(
-            addr, msg, request_id,
-            "Timeout waiting for commit acknowledgement".to_string(),
-        ).await?;
+        let msg = MeerkatMessage::Commit {
+            request_id,
+            txn_id: tid.clone(),
+            reply_to,
+        };
+        let reply = self
+            .send_and_await_reply(
+                addr,
+                msg,
+                request_id,
+                "Timeout waiting for commit acknowledgement".to_string(),
+            )
+            .await?;
         match reply {
             MeerkatMessage::CommitResponse { success, error, .. } => {
-                if success { Ok(()) }
-                else { Err(EvalError::NetworkError(error.unwrap_or_else(|| "Participant commit failed".to_string()))) }
+                if success {
+                    Ok(())
+                } else {
+                    Err(EvalError::NetworkError(
+                        error.unwrap_or_else(|| "Participant commit failed".to_string()),
+                    ))
+                }
             }
-            _ => Err(EvalError::NetworkError("Unexpected reply to commit".to_string())),
+            _ => Err(EvalError::NetworkError(
+                "Unexpected reply to commit".to_string(),
+            )),
         }
     }
 
@@ -812,23 +989,41 @@ impl Manager {
         static NEXT_ABORT_ID: AtomicU64 = AtomicU64::new(1);
         let request_id = NEXT_ABORT_ID.fetch_add(1, Ordering::SeqCst);
         let reply_to = self.local_reply_addr().await;
-        let msg = MeerkatMessage::Abort { request_id, txn_id: tid.clone(), reply_to };
+        let msg = MeerkatMessage::Abort {
+            request_id,
+            txn_id: tid.clone(),
+            reply_to,
+        };
         // We await the ack so that in the normal case the participant's locks
         // are released before we return. If the ack times out the participant
         // may still hold locks; durable abort retries and error reporting are
         // tracked under issue #54.
-        let _ = self.send_and_await_reply(
-            addr, msg, request_id,
-            "Timeout waiting for abort acknowledgement".to_string(),
-        ).await;
+        let _ = self
+            .send_and_await_reply(
+                addr,
+                msg,
+                request_id,
+                "Timeout waiting for abort acknowledgement".to_string(),
+            )
+            .await;
     }
 
-    pub async fn execute_action(&mut self, service_name: &str, stmts: &[ActionStmt]) -> Result<(), EvalError> {
+    pub async fn execute_action(
+        &mut self,
+        service_name: &str,
+        stmts: &[ActionStmt],
+    ) -> Result<(), EvalError> {
         self.execute_action_with_txn(service_name, stmts, &[]).await
     }
 
-    pub async fn execute_action_with_env(&mut self, service_name: &str, stmts: &[ActionStmt], initial_env: &[(String, Value)]) -> Result<(), EvalError> {
-        self.execute_action_with_txn(service_name, stmts, initial_env).await
+    pub async fn execute_action_with_env(
+        &mut self,
+        service_name: &str,
+        stmts: &[ActionStmt],
+        initial_env: &[(String, Value)],
+    ) -> Result<(), EvalError> {
+        self.execute_action_with_txn(service_name, stmts, initial_env)
+            .await
     }
 }
 
@@ -846,13 +1041,16 @@ mod tests {
     #[tokio::test]
     async fn test_create_service_with_var() {
         let mut manager = Manager::new();
-        let decls = vec![
-            Decl::VarDecl {
-                name: "x".to_string(),
-                val: Expr::Literal { val: Value::Number { val: 1 } },
+        let decls = vec![Decl::VarDecl {
+            name: "x".to_string(),
+            val: Expr::Literal {
+                val: Value::Number { val: 1 },
             },
-        ];
-        manager.create_service("foo".to_string(), decls).await.unwrap();
+        }];
+        manager
+            .create_service("foo".to_string(), decls)
+            .await
+            .unwrap();
         let result = manager.lookup("x", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 1 });
     }
@@ -863,19 +1061,28 @@ mod tests {
         let decls = vec![
             Decl::VarDecl {
                 name: "x".to_string(),
-                val: Expr::Literal { val: Value::Number { val: 2 } },
+                val: Expr::Literal {
+                    val: Value::Number { val: 2 },
+                },
             },
             Decl::DefDecl {
                 name: "f".to_string(),
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
-                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 3 } }),
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 3 },
+                    }),
                 },
                 is_pub: true,
             },
         ];
-        manager.create_service("foo".to_string(), decls).await.unwrap();
+        manager
+            .create_service("foo".to_string(), decls)
+            .await
+            .unwrap();
         let result = manager.lookup("f", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 5 });
     }
@@ -883,7 +1090,10 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_missing_var_returns_error() {
         let mut manager = Manager::new();
-        manager.create_service("foo".to_string(), vec![]).await.unwrap();
+        manager
+            .create_service("foo".to_string(), vec![])
+            .await
+            .unwrap();
         let result = manager.lookup("nonexistent", "foo", None).await;
         assert!(result.is_err());
     }
@@ -895,26 +1105,38 @@ mod tests {
         let decls = vec![
             Decl::VarDecl {
                 name: "x".to_string(),
-                val: Expr::Literal { val: Value::Number { val: 1 } },
+                val: Expr::Literal {
+                    val: Value::Number { val: 1 },
+                },
             },
             Decl::DefDecl {
                 name: "f".to_string(),
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
-                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 10 } }),
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 10 },
+                    }),
                 },
                 is_pub: true,
             },
         ];
-        manager.create_service("foo".to_string(), decls).await.unwrap();
+        manager
+            .create_service("foo".to_string(), decls)
+            .await
+            .unwrap();
 
         // f should be 11 initially
         let result = manager.lookup("f", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 11 });
 
         // update x to 5, f should become 15
-        manager.assign("foo", "x", Value::Number { val: 5 }, None).await.unwrap();
+        manager
+            .assign("foo", "x", Value::Number { val: 5 }, None)
+            .await
+            .unwrap();
         let result = manager.lookup("f", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 15 });
     }
@@ -922,13 +1144,16 @@ mod tests {
     // Helper: service with a single var x = 0
     async fn manager_with_x() -> Manager {
         let mut manager = Manager::new();
-        let decls = vec![
-            Decl::VarDecl {
-                name: "x".to_string(),
-                val: Expr::Literal { val: Value::Number { val: 0 } },
+        let decls = vec![Decl::VarDecl {
+            name: "x".to_string(),
+            val: Expr::Literal {
+                val: Value::Number { val: 0 },
             },
-        ];
-        manager.create_service("foo".to_string(), decls).await.unwrap();
+        }];
+        manager
+            .create_service("foo".to_string(), decls)
+            .await
+            .unwrap();
         manager
     }
 
@@ -937,16 +1162,18 @@ mod tests {
     #[tokio::test]
     async fn test_txn_read_then_write_upgrades_lock() {
         let mut manager = manager_with_x().await;
-        let stmts = vec![
-            ActionStmt::Assign {
-                var: "x".to_string(),
-                expr: Expr::Binop {
-                    op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
-                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
-                },
+        let stmts = vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable {
+                    ident: "x".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 1 },
+                }),
             },
-        ];
+        }];
         manager.execute_action("foo", &stmts).await.unwrap();
         let result = manager.lookup("x", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 1 });
@@ -957,16 +1184,18 @@ mod tests {
     #[tokio::test]
     async fn test_txn_locks_released_between_transactions() {
         let mut manager = manager_with_x().await;
-        let stmts = vec![
-            ActionStmt::Assign {
-                var: "x".to_string(),
-                expr: Expr::Binop {
-                    op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
-                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
-                },
+        let stmts = vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable {
+                    ident: "x".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 1 },
+                }),
             },
-        ];
+        }];
         manager.execute_action("foo", &stmts).await.unwrap();
         manager.execute_action("foo", &stmts).await.unwrap();
         let result = manager.lookup("x", "foo", None).await.unwrap();
@@ -977,14 +1206,21 @@ mod tests {
     #[tokio::test]
     async fn test_txn_var_unlocked_after_commit() {
         let mut manager = manager_with_x().await;
-        let stmts = vec![
-            ActionStmt::Assign {
-                var: "x".to_string(),
-                expr: Expr::Literal { val: Value::Number { val: 42 } },
+        let stmts = vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Literal {
+                val: Value::Number { val: 42 },
             },
-        ];
+        }];
         manager.execute_action("foo", &stmts).await.unwrap();
-        let lock = &manager.services.get("foo").unwrap().vars.get("x").unwrap().lock;
+        let lock = &manager
+            .services
+            .get("foo")
+            .unwrap()
+            .vars
+            .get("x")
+            .unwrap()
+            .lock;
         assert!(matches!(lock, crate::runtime::txn::VarLock::Unlocked));
     }
 
@@ -996,16 +1232,18 @@ mod tests {
     async fn test_txn_nested_do_reuses_transaction() {
         let mut manager = manager_with_x().await;
         // outer action: do (action { x = x + 1; });
-        let inner = Expr::Action(vec![
-            ActionStmt::Assign {
-                var: "x".to_string(),
-                expr: Expr::Binop {
-                    op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
-                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
-                },
+        let inner = Expr::Action(vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable {
+                    ident: "x".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 1 },
+                }),
             },
-        ]);
+        }]);
         let stmts = vec![ActionStmt::Do(inner)];
         manager.execute_action("foo", &stmts).await.unwrap();
 
@@ -1013,7 +1251,14 @@ mod tests {
         let result = manager.lookup("x", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 1 });
         // and the lock was released
-        let lock = &manager.services.get("foo").unwrap().vars.get("x").unwrap().lock;
+        let lock = &manager
+            .services
+            .get("foo")
+            .unwrap()
+            .vars
+            .get("x")
+            .unwrap()
+            .lock;
         assert!(matches!(lock, crate::runtime::txn::VarLock::Unlocked));
     }
 
@@ -1026,9 +1271,13 @@ mod tests {
         let stmts = vec![
             ActionStmt::Assign {
                 var: "x".to_string(),
-                expr: Expr::Literal { val: Value::Number { val: 99 } },
+                expr: Expr::Literal {
+                    val: Value::Number { val: 99 },
+                },
             },
-            ActionStmt::Assert(Expr::Literal { val: Value::Bool { val: false } }),
+            ActionStmt::Assert(Expr::Literal {
+                val: Value::Bool { val: false },
+            }),
         ];
         let result = manager.execute_action("foo", &stmts).await;
         assert!(result.is_err());
@@ -1036,7 +1285,14 @@ mod tests {
         let x = manager.lookup("x", "foo", None).await.unwrap();
         assert_eq!(x, Value::Number { val: 0 });
         // and the lock was released
-        let lock = &manager.services.get("foo").unwrap().vars.get("x").unwrap().lock;
+        let lock = &manager
+            .services
+            .get("foo")
+            .unwrap()
+            .vars
+            .get("x")
+            .unwrap()
+            .lock;
         assert!(matches!(lock, crate::runtime::txn::VarLock::Unlocked));
     }
 
@@ -1051,18 +1307,46 @@ mod tests {
             var: "w".to_string(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { ident: "w".to_string() }),
-                expr2: Box::new(Expr::Literal { val: Value::Number { val: 5 } }),
+                expr1: Box::new(Expr::Variable {
+                    ident: "w".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 5 },
+                }),
             },
         }]);
-        manager.create_service("s2".to_string(), vec![
-            Decl::VarDecl { name: "w".to_string(), val: Expr::Literal { val: Value::Number { val: 10 } } },
-            Decl::DefDecl { name: "bump".to_string(), val: bump, is_pub: true },
-        ]).await.unwrap();
+        manager
+            .create_service(
+                "s2".to_string(),
+                vec![
+                    Decl::VarDecl {
+                        name: "w".to_string(),
+                        val: Expr::Literal {
+                            val: Value::Number { val: 10 },
+                        },
+                    },
+                    Decl::DefDecl {
+                        name: "bump".to_string(),
+                        val: bump,
+                        is_pub: true,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
         // s1 owns x.
-        manager.create_service("s1".to_string(), vec![
-            Decl::VarDecl { name: "x".to_string(), val: Expr::Literal { val: Value::Number { val: 0 } } },
-        ]).await.unwrap();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
 
         // Transaction on s1: x = x + 1; do s2.bump;
         let stmts = vec![
@@ -1070,19 +1354,52 @@ mod tests {
                 var: "x".to_string(),
                 expr: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
-                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    }),
                 },
             },
-            ActionStmt::Do(Expr::MemberAccess { service: "s2".to_string(), member: "bump".to_string() }),
+            ActionStmt::Do(Expr::MemberAccess {
+                service: "s2".to_string(),
+                member: "bump".to_string(),
+            }),
         ];
         manager.execute_action("s1", &stmts).await.unwrap();
 
         // Both services' writes committed.
-        assert_eq!(manager.lookup("x", "s1", None).await.unwrap(), Value::Number { val: 1 });
-        assert_eq!(manager.lookup("w", "s2", None).await.unwrap(), Value::Number { val: 15 });
+        assert_eq!(
+            manager.lookup("x", "s1", None).await.unwrap(),
+            Value::Number { val: 1 }
+        );
+        assert_eq!(
+            manager.lookup("w", "s2", None).await.unwrap(),
+            Value::Number { val: 15 }
+        );
         // Locks released on both services.
-        assert!(matches!(manager.services.get("s1").unwrap().vars.get("x").unwrap().lock, crate::runtime::txn::VarLock::Unlocked));
-        assert!(matches!(manager.services.get("s2").unwrap().vars.get("w").unwrap().lock, crate::runtime::txn::VarLock::Unlocked));
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
+        assert!(matches!(
+            manager
+                .services
+                .get("s2")
+                .unwrap()
+                .vars
+                .get("w")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
     }
 }

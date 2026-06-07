@@ -1,11 +1,11 @@
-use super::{messages::*, types::*, protocol::*};
+use super::{messages::*, protocol::*, types::*};
 use futures::AsyncWriteExt;
-use kameo::Actor;
-use libp2p::{Multiaddr, PeerId};
-use libp2p::core::multiaddr::Protocol;
-use libp2p_stream as stream;
 use futures::StreamExt;
+use kameo::Actor;
+use libp2p::core::multiaddr::Protocol;
 use libp2p::Stream;
+use libp2p::{Multiaddr, PeerId};
+use libp2p_stream as stream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -47,7 +47,7 @@ pub struct NetworkActor {
 #[cfg(not(target_arch = "wasm32"))]
 async fn build_swarm() -> anyhow::Result<(libp2p::Swarm<MeerkatBehaviour>, PeerId)> {
     use libp2p::identify;
-    
+
     let swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -55,15 +55,9 @@ async fn build_swarm() -> anyhow::Result<(libp2p::Swarm<MeerkatBehaviour>, PeerI
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
-        .with_websocket(
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )
+        .with_websocket(libp2p::noise::Config::new, libp2p::yamux::Config::default)
         .await?
-        .with_relay_client(
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )?
+        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|keypair, relay_client| {
             let relay_config = libp2p::relay::Config {
                 max_reservations: 1000,
@@ -71,13 +65,10 @@ async fn build_swarm() -> anyhow::Result<(libp2p::Swarm<MeerkatBehaviour>, PeerI
                 max_circuits_per_peer: 100,
                 ..Default::default()
             };
-            
+
             Ok(MeerkatBehaviour {
                 stream: stream::Behaviour::new(),
-                relay: libp2p::relay::Behaviour::new(
-                    keypair.public().to_peer_id(),
-                    relay_config,
-                ),
+                relay: libp2p::relay::Behaviour::new(keypair.public().to_peer_id(), relay_config),
                 relay_client,
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/meerkat/1.0.0".to_string(),
@@ -85,11 +76,9 @@ async fn build_swarm() -> anyhow::Result<(libp2p::Swarm<MeerkatBehaviour>, PeerI
                 )),
             })
         })?
-        .with_swarm_config(|c| {
-            c.with_idle_connection_timeout(std::time::Duration::from_secs(60))
-        })
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
-    
+
     let peer_id = *swarm.local_peer_id();
     Ok((swarm, peer_id))
 }
@@ -119,17 +108,12 @@ async fn build_swarm() -> anyhow::Result<(libp2p::Swarm<MeerkatBehaviour>, PeerI
 
     let behaviour = MeerkatBehaviour {
         stream: stream::Behaviour::new(),
-        relay: libp2p::relay::Behaviour::new(
-            local_peer_id,
-            relay_config,
-        ),
+        relay: libp2p::relay::Behaviour::new(local_peer_id, relay_config),
         relay_client,
-        identify: libp2p::identify::Behaviour::new(
-            libp2p::identify::Config::new(
-                "/meerkat/1.0.0".to_string(),
-                id_keys.public(),
-            )
-        ),
+        identify: libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
+            "/meerkat/1.0.0".to_string(),
+            id_keys.public(),
+        )),
     };
 
     let swarm = libp2p::Swarm::new(
@@ -178,9 +162,7 @@ impl NetworkActor {
     pub async fn handle_command(&mut self, cmd: NetworkCommand) -> NetworkReply {
         match cmd {
             NetworkCommand::SendMessage { addr, msg } => {
-                let msg_id = MessageId(
-                    self.next_message_id.fetch_add(1, Ordering::SeqCst)
-                );
+                let msg_id = MessageId(self.next_message_id.fetch_add(1, Ordering::SeqCst));
                 let local_addr = match self.translate_address(&addr) {
                     Ok(a) => a,
                     Err(e) => return NetworkReply::Failure(e.to_string()),
@@ -194,10 +176,9 @@ impl NetworkActor {
             }
             NetworkCommand::Listen { addr } => {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                let _ = self.command_tx.send(SwarmCommand::Listen {
-                    addr,
-                    reply_tx,
-                });
+                let _ = self
+                    .command_tx
+                    .send(SwarmCommand::Listen { addr, reply_tx });
                 match reply_rx.await {
                     Ok(Ok(actual_addr)) => {
                         self.local_addrs.push(actual_addr.clone());
@@ -207,16 +188,14 @@ impl NetworkActor {
                     Err(_) => NetworkReply::Failure("Event loop dropped".to_string()),
                 }
             }
-            NetworkCommand::GetLocalAddresses => {
-                NetworkReply::LocalAddresses {
-                    addrs: self.local_addrs.clone(),
-                }
-            }
+            NetworkCommand::GetLocalAddresses => NetworkReply::LocalAddresses {
+                addrs: self.local_addrs.clone(),
+            },
             NetworkCommand::ListenViaRelay { relay_addr } => {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                let _ = self.command_tx.send(SwarmCommand::ListenViaRelay { 
-                    relay_addr, 
-                    reply_tx 
+                let _ = self.command_tx.send(SwarmCommand::ListenViaRelay {
+                    relay_addr,
+                    reply_tx,
                 });
                 match reply_rx.await {
                     Ok(Ok(circuit_addr)) => {
@@ -235,15 +214,15 @@ impl NetworkActor {
             NodeType::Server => Ok(canonical.clone()),
             NodeType::BrowserClient { relay_server } => {
                 // Check if address already goes through OUR relay
-                if canonical.0.starts_with(&relay_server.0) && canonical.0.contains("/p2p-circuit") {
+                if canonical.0.starts_with(&relay_server.0) && canonical.0.contains("/p2p-circuit")
+                {
                     // Already using our relay, no translation needed
                     Ok(canonical.clone())
                 } else if canonical.0.starts_with("/ip4/") || canonical.0.starts_with("/ip6/") {
                     // Regular IP address or circuit through different relay, add our relay hop
                     Ok(Address::new(format!(
                         "{}/p2p-circuit/{}",
-                        relay_server.0,
-                        canonical.0
+                        relay_server.0, canonical.0
                     )))
                 } else {
                     Ok(canonical.clone())
@@ -266,8 +245,12 @@ impl NetworkActor {
         let mut control = swarm.behaviour().stream.new_control();
         let mut incoming = control.accept(MEERKAT_PROTOCOL).unwrap();
         let mut pending_sends: HashMap<PeerId, Vec<(MessageId, MeerkatMessage)>> = HashMap::new();
-        let mut pending_listen: Option<tokio::sync::oneshot::Sender<Result<Address, String>>> = None;
-        let mut pending_relay: Option<(Address, tokio::sync::oneshot::Sender<Result<Address, String>>)> = None;
+        let mut pending_listen: Option<tokio::sync::oneshot::Sender<Result<Address, String>>> =
+            None;
+        let mut pending_relay: Option<(
+            Address,
+            tokio::sync::oneshot::Sender<Result<Address, String>>,
+        )> = None;
 
         loop {
             tokio::select! {
@@ -375,7 +358,10 @@ impl NetworkActor {
         if swarm.is_connected(&peer_id) {
             Self::send_to_peer(control, peer_id, msg_id, msg, event_tx).await;
         } else {
-            pending_sends.entry(peer_id).or_default().push((msg_id, msg));
+            pending_sends
+                .entry(peer_id)
+                .or_default()
+                .push((msg_id, msg));
             if let Err(e) = swarm.dial(multiaddr) {
                 let _ = event_tx.send(NetworkEvent::SendFailed {
                     msg_id,
@@ -438,13 +424,16 @@ impl NetworkActor {
         pending_sends: &mut HashMap<PeerId, Vec<(MessageId, MeerkatMessage)>>,
         event_tx: &mpsc::UnboundedSender<NetworkEvent>,
         pending_listen: &mut Option<tokio::sync::oneshot::Sender<Result<Address, String>>>,
-        pending_relay: &mut Option<(Address, tokio::sync::oneshot::Sender<Result<Address, String>>)>,
+        pending_relay: &mut Option<(
+            Address,
+            tokio::sync::oneshot::Sender<Result<Address, String>>,
+        )>,
     ) {
         match event {
             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                 let addr = Address(address.to_string());
                 //println!("New listen addr: {}", addr.0);
-                
+
                 if addr.0.contains("/p2p-circuit") {
                     //println!("Circuit relay address detected!");
                     if let Some((_, reply_tx)) = pending_relay.take() {
@@ -453,7 +442,7 @@ impl NetworkActor {
                         return;
                     }
                 }
-                
+
                 if let Some(tx) = pending_listen.take() {
                     let _ = tx.send(Ok(addr));
                 }
@@ -463,20 +452,21 @@ impl NetworkActor {
                 let _ = event_tx.send(NetworkEvent::PeerConnected {
                     peer: peer_id.to_string(),
                 });
-                
+
                 if let Some((relay_addr, _)) = pending_relay.as_ref() {
                     if let Ok(relay_multiaddr) = relay_addr.0.parse::<Multiaddr>() {
                         if let Some(relay_peer) = Self::extract_peer_id(&relay_multiaddr) {
                             if relay_peer == peer_id {
                                 //println!("Connected to relay {}, now listening via circuit", peer_id);
-                                let circuit_listen_addr = relay_multiaddr.with(Protocol::P2pCircuit);
+                                let circuit_listen_addr =
+                                    relay_multiaddr.with(Protocol::P2pCircuit);
                                 //println!("Calling listen_on with: {}", circuit_listen_addr);
                                 swarm.listen_on(circuit_listen_addr).ok();
                             }
                         }
                     }
                 }
-                
+
                 if let Some(messages) = pending_sends.remove(&peer_id) {
                     for (msg_id, msg) in messages {
                         Self::send_to_peer(control, peer_id, msg_id, msg, event_tx).await;
@@ -508,7 +498,8 @@ impl NetworkActor {
     fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
         // For circuit relay addresses, we need the LAST peer ID (the destination)
         // Format: /ip4/.../p2p/RELAY/p2p-circuit/p2p/DEST
-        let mut peer_ids: Vec<PeerId> = addr.iter()
+        let mut peer_ids: Vec<PeerId> = addr
+            .iter()
             .filter_map(|proto| {
                 if let Protocol::P2p(peer_id) = proto {
                     Some(peer_id)
@@ -517,7 +508,7 @@ impl NetworkActor {
                 }
             })
             .collect();
-        
+
         // Return the last peer ID found (for circuits, this is the destination)
         peer_ids.pop()
     }

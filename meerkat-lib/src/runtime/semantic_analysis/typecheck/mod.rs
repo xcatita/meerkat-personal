@@ -48,7 +48,7 @@ impl Display for Type {
             Type::Int => write!(f, "int"),
             Type::Bool => write!(f, "bool"),
             Type::String => write!(f, "string"),
-            Type::Vector( .. ) => write!(f, "vector"),
+            Type::Vector(..) => write!(f, "vector"),
             Type::Unit => write!(f, "unit"),
             Type::Action => write!(f, "action"),
             Type::Fun(args, ret) => {
@@ -64,7 +64,7 @@ impl Display for Type {
                 }
             }
             Type::TypVar(name) => write!(f, "{}", name),
-            Type::Table( schema) => write!(f, "table {:?}", schema),
+            Type::Table(schema) => write!(f, "table {:?}", schema),
         }
     }
 }
@@ -78,7 +78,6 @@ pub struct TypecheckEnv {
     pub typevar_id: u64,
     // Type::var to type (canonical form)
     pub acc_subst: HashMap<String, Type>,
-    
 }
 
 impl Display for TypecheckEnv {
@@ -111,10 +110,10 @@ pub fn typecheck_prog(prog: &Vec<Stmt>) {
                     .expect(&format!(
                         "Test: test instantiate a non-existing service {:?}",
                         service
-                    )).typecheck_action(stmts);
+                    ))
+                    .typecheck_action(stmts);
             }
-            _ => panic!("not implemented")
+            _ => panic!("not implemented"),
         }
     }
-
 }

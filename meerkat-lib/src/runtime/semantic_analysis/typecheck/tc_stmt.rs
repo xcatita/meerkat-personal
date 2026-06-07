@@ -1,8 +1,8 @@
 use crate::ast::{ActionStmt, DataType, Decl, Expr, Field};
 
-use std::collections::HashSet;
 use super::TypecheckEnv;
 use crate::static_analysis::typecheck::Type;
+use std::collections::HashSet;
 
 impl TypecheckEnv {
     pub fn typecheck_decl(&mut self, decl: &Decl) {
@@ -15,14 +15,15 @@ impl TypecheckEnv {
                 let typ = self.infer_expr(&val);
                 self.name_context.insert(name.clone(), typ);
             }
-            Decl::TableDecl { name, fields } =>  {
+            Decl::TableDecl { name, fields } => {
                 let mut names = HashSet::new();
                 for field in fields {
                     if !names.insert(field.name.clone()) {
                         panic!("Duplicate names found in table {}", name)
                     }
                 }
-                self.var_context.insert(name.clone(), Type::Table(fields.to_vec()));
+                self.var_context
+                    .insert(name.clone(), Type::Table(fields.to_vec()));
             }
         }
     }
@@ -58,7 +59,7 @@ impl TypecheckEnv {
                                 for keyval in keyvals {
                                     match keyval {
                                         Expr::KeyVal { key, value} => {
-                                            
+
                                             let field_type = schema.iter().find(|f| f.name == *key)
                                                 .unwrap_or_else(|| panic!("Field '{}' not found in table '{}' schema", key, insert.table_name));
                                             let expected_type = match field_type.type_ {

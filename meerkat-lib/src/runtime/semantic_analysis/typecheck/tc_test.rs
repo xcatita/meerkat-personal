@@ -16,7 +16,7 @@ impl TypecheckEnv {
                         panic!("Assert statement requires bool expression");
                     }
                 }
-                _ => panic!("not implemented")
+                _ => panic!("not implemented"),
             }
         }
     }

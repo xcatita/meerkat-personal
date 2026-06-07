@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct MessageId(pub u64);
 
 /// Address - canonical internet-routable address
-/// Examples: 
+/// Examples:
 /// - Server: "/ip4/203.0.113.10/tcp/9000/p2p/12D3..."
 /// - Client: "/ip4/203.0.113.10/tcp/9000/p2p/server-id/ws/p2p/client-id"
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -44,31 +44,25 @@ impl ServiceId {
 pub enum MeerkatMessage {
     /// Ping for testing
     Ping { content: String },
-    
+
     /// Pong response
     Pong { content: String },
-    
+
     /// Peer announcement with their canonical address
     Announce { peer_addr: Address },
-    
+
     /// Transaction message (for future use)
-    Transaction {
-        tx_id: u64,
-        payload: Vec<u8>,
-    },
-    
+    Transaction { tx_id: u64, payload: Vec<u8> },
+
     /// Propagation message (for future use)
-    Propagation {
-        var_id: u64,
-        new_value: Vec<u8>,
-    },
+    Propagation { var_id: u64, new_value: Vec<u8> },
 
     /// Request to look up a member of a service on a remote node
     LookupRequest {
         request_id: u64,
         service: String,
         member: String,
-        reply_to: String,  // full multiaddr of the requester
+        reply_to: String, // full multiaddr of the requester
         /// When Some, the read joins this transaction: the owning node acquires
         /// and holds a read lock under the shared id until commit/abort. When
         /// None, it is a plain unlocked read.
@@ -78,14 +72,11 @@ pub enum MeerkatMessage {
     /// Response to a LookupRequest with the serialized value
     LookupResponse {
         request_id: u64,
-        value: String,  // JSON-serialized Value
+        value: String, // JSON-serialized Value
     },
 
     /// Response indicating lookup failed
-    LookupError {
-        request_id: u64,
-        error: String,
-    },
+    LookupError { request_id: u64, error: String },
 
     /// Execute an action on a remote service
     ActionRequest {
@@ -133,9 +124,7 @@ pub enum MeerkatMessage {
     },
 
     /// Acknowledgement that an Abort was processed on a participant.
-    AbortResponse {
-        request_id: u64,
-    },
+    AbortResponse { request_id: u64 },
 }
 
 /// Errors that can occur when sending
@@ -143,10 +132,10 @@ pub enum MeerkatMessage {
 pub enum SendError {
     /// Could not resolve/reach the address
     UnreachableAddress(Address),
-    
+
     /// Connection dropped before send completed
     ConnectionLost(String),
-    
+
     /// Message too large or other protocol error
     ProtocolError(String),
 }

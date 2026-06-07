@@ -1,7 +1,7 @@
 use core::panic;
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, ActionStmt};
+use crate::ast::{ActionStmt, Expr};
 
 impl Expr {
     /// alpha renaming of expression e
@@ -18,7 +18,7 @@ impl Expr {
                     *ident = renames.get(ident).unwrap().clone();
                 }
             }
-            Expr::KeyVal { value , .. } => {
+            Expr::KeyVal { value, .. } => {
                 value.alpha_rename(var_binded, renames);
             }
             Expr::Tuple { val } => {
@@ -69,11 +69,15 @@ impl Expr {
                     record.alpha_rename(var_binded, renames);
                 }
             }
-            Expr::Fold { table_name, column_name, operation, identity } => {
+            Expr::Fold {
+                table_name,
+                column_name,
+                operation,
+                identity,
+            } => {
                 operation.alpha_rename(var_binded, renames);
                 identity.alpha_rename(var_binded, renames);
-            },
-        
+            }
         }
     }
 }

@@ -3,12 +3,12 @@
 //! Simplified implementation for issue #19. The existing transaction.rs
 //! and lock.rs provide the full actor-based infrastructure for future use.
 
-use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::Mutex;
-use serde::{Serialize, Deserialize};
+use crate::net::{Address, ServiceId};
 use crate::runtime::ast::Value;
-use crate::net::{ServiceId, Address};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A globally unique transaction identifier.
 ///
@@ -55,7 +55,11 @@ impl TxnId {
             *last = ts;
             ts
         };
-        TxnId { timestamp, node_id, iteration: 0 }
+        TxnId {
+            timestamp,
+            node_id,
+            iteration: 0,
+        }
     }
 
     /// Return a new TxnId with the same timestamp/node but higher iteration,
