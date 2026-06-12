@@ -1,7 +1,4 @@
 //! Transaction ID and per-variable lock state for the Manager.
-//!
-//! Simplified implementation for issue #19. The existing transaction.rs
-//! and lock.rs provide the full actor-based infrastructure for future use.
 
 use crate::net::{Address, ServiceId};
 use crate::runtime::ast::Value;
