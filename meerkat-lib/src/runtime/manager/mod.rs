@@ -709,10 +709,16 @@ impl Manager {
         if var_state.lock.try_write(txn_id) {
             Ok(())
         } else {
-            Err(EvalError::LockConflict(format!(
-                "Variable '{}' is already locked; cannot acquire write lock",
-                var
-            )))
+            match var_state.lock.wait_die(txn_id) {
+                crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
+                    "transaction died contending for write lock on '{}'",
+                    var
+                ))),
+                crate::runtime::txn::WaitDie::Wait => Err(EvalError::LockConflict(format!(
+                    "Variable '{}' is already locked; cannot acquire write lock",
+                    var
+                ))),
+            }
         }
     }
 
@@ -734,10 +740,16 @@ impl Manager {
         if var_state.lock.try_read(txn_id) {
             Ok(())
         } else {
-            Err(EvalError::LockConflict(format!(
-                "Variable '{}' is write-locked by another transaction",
-                var
-            )))
+            match var_state.lock.wait_die(txn_id) {
+                crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
+                    "transaction died contending for read lock on '{}'",
+                    var
+                ))),
+                crate::runtime::txn::WaitDie::Wait => Err(EvalError::LockConflict(format!(
+                    "Variable '{}' is write-locked by another transaction",
+                    var
+                ))),
+            }
         }
     }
 
@@ -759,10 +771,16 @@ impl Manager {
         if var_state.lock.upgrade_to_write(txn_id) {
             Ok(())
         } else {
-            Err(EvalError::LockConflict(format!(
-                "Variable '{}' cannot be upgraded to a write lock; held by another transaction",
-                var
-            )))
+            match var_state.lock.wait_die(txn_id) {
+                crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
+                    "transaction died contending to upgrade lock on '{}'",
+                    var
+                ))),
+                crate::runtime::txn::WaitDie::Wait => Err(EvalError::LockConflict(format!(
+                    "Variable '{}' cannot be upgraded to a write lock; held by another transaction",
+                    var
+                ))),
+            }
         }
     }
 
@@ -797,48 +815,77 @@ impl Manager {
         stmts: &[ActionStmt],
         initial_env: &[(String, Value)],
     ) -> Result<(), EvalError> {
-        // The transaction owns all its state and is passed down through
-        // execution; nothing transaction-specific lives on the Manager.
-        let mut txn = Transaction::new(TxnId::new(self.node_id));
+        // Wait-die: a transaction that dies on a lock conflict (an older
+        // transaction holds the lock) aborts and retries with a higher
+        // iteration but the same age, bounded so a permanently held lock
+        // cannot loop forever. True blocking for the "wait" case (the older
+        // transaction holding its place) is tracked separately under #30
+        // stage 2.
+        const MAX_WAIT_DIE_RETRIES: u32 = 10;
+        let mut txn_id = TxnId::new(self.node_id);
 
-        // Execute statements; read/write locks are acquired lazily inside
-        // lookup/assign as variables are accessed
-        let mut env: Vec<(String, Value)> = initial_env.to_vec();
-        let mut exec_error: Option<EvalError> = None;
-        for stmt in stmts {
-            match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                Ok(_) => {}
-                Err(e) => {
-                    exec_error = Some(e);
-                    break;
+        loop {
+            // The transaction owns all its state and is passed down through
+            // execution; nothing transaction-specific lives on the Manager.
+            let mut txn = Transaction::new(txn_id.clone());
+
+            // Execute statements; read/write locks are acquired lazily inside
+            // lookup/assign as variables are accessed
+            let mut env: Vec<(String, Value)> = initial_env.to_vec();
+            let mut exec_error: Option<EvalError> = None;
+            for stmt in stmts {
+                match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
+                    Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
+                    Ok(_) => {}
+                    Err(e) => {
+                        exec_error = Some(e);
+                        break;
+                    }
                 }
             }
-        }
 
-        // The commit/abort decision depends only on whether execution
-        // succeeded. Once execution succeeds the writes are applied and become
-        // visible, so commit messaging to participants is best-effort and never
-        // turns a successful transaction into a failed one (commit retries are
-        // tracked separately under issue #54).
-        if exec_error.is_none() {
-            self.apply_committed_writes(&txn).await;
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                let _ = self.send_commit(addr, &txn.id).await;
+            // Wait-die abort: discard this attempt, abort participants, release
+            // locks, and retry with a higher iteration up to the bound. A died
+            // attempt never applies its buffered writes, so re-running from
+            // scratch is safe.
+            if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
+                }
+                self.release_locks(&txn.locked, &txn.id);
+                if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
+                    txn_id = txn_id.retry();
+                    continue;
+                }
+                return Err(exec_error.unwrap());
             }
-        } else {
-            // Execution failed: discard buffered writes and abort participants.
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                self.send_abort(addr, &txn.id).await;
+
+            // The commit/abort decision depends only on whether execution
+            // succeeded. Once execution succeeds the writes are applied and
+            // become visible, so commit messaging to participants is
+            // best-effort and never turns a successful transaction into a
+            // failed one (commit retries are tracked separately under issue
+            // #54).
+            if exec_error.is_none() {
+                self.apply_committed_writes(&txn).await;
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    let _ = self.send_commit(addr, &txn.id).await;
+                }
+            } else {
+                // Execution failed: discard buffered writes and abort
+                // participants.
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
+                }
             }
-        }
 
-        // Release all locks held locally (always, even on error)
-        self.release_locks(&txn.locked, &txn.id);
+            // Release all locks held locally (always, even on error)
+            self.release_locks(&txn.locked, &txn.id);
 
-        match exec_error {
-            Some(e) => Err(e),
-            None => Ok(()),
+            return match exec_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
         }
     }
 
@@ -1462,6 +1509,143 @@ mod tests {
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::Unlocked
+        ));
+    }
+
+    // Wait-die: a younger transaction contending for a lock held by an older
+    // transaction dies (abort) rather than acquiring it.
+    #[tokio::test]
+    async fn test_wait_die_younger_dies_at_acquire() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        let result = manager.acquire_write_lock("s1", "x", &younger);
+        assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
+    }
+
+    // Wait-die: an older transaction contending for a lock held by a younger
+    // transaction takes the wait path, which in stage 1 surfaces as a lock
+    // conflict (true blocking is stage 2), not a die/abort.
+    #[tokio::test]
+    async fn test_wait_die_older_takes_wait_path() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let result = manager.acquire_write_lock("s1", "x", &older);
+        assert!(matches!(result, Err(EvalError::LockConflict(_))));
+    }
+
+    // Wait-die end to end: an action whose variable is held by an older
+    // transaction dies and retries, and after exhausting the bounded retries
+    // returns WaitDieAbort without disturbing the older holder's lock.
+    #[tokio::test]
+    async fn test_wait_die_action_dies_and_retries() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+        let stmts = vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable {
+                    ident: "x".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 1 },
+                }),
+            },
+        }];
+        let result = manager.execute_action("s1", &stmts).await;
+        assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
         ));
     }
 }

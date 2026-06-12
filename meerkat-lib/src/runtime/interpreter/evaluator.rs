@@ -10,6 +10,9 @@ pub enum EvalError {
     LookupError(String),
     NotImplemented,
     LockConflict(String),
+    /// A transaction lost a wait-die contest (an older transaction holds the
+    /// lock) and must abort and retry with a higher iteration.
+    WaitDieAbort(String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -20,6 +23,7 @@ impl std::fmt::Display for EvalError {
             EvalError::LookupError(s) => write!(f, "Lookup error: {}", s),
             EvalError::NotImplemented => write!(f, "Not yet implemented"),
             EvalError::LockConflict(s) => write!(f, "Lock conflict: {}", s),
+            EvalError::WaitDieAbort(s) => write!(f, "Wait-die abort: {}", s),
         }
     }
 }
