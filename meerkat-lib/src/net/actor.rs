@@ -12,6 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot::Sender;
 
+/// The connection timeout for idle swarm connections
+#[cfg(not(target_arch = "wasm32"))]
+const IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The maximum duration to wait for a relay reservation response
+const RELAY_RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct MeerkatBehaviour {
     stream: stream::Behaviour,
@@ -22,7 +29,7 @@ struct MeerkatBehaviour {
 
 /// State of a pending relay reservation attempt
 enum PendingRelayState {
-    /// Actively dialing the relay server before we can listen
+    /// Actively dialing the relay server before calling `swarm.listen_on`
     Dialing(Address, Sender<Result<Address, String>>),
     /// Dial completed and currently listening on the circuit relay address
     Listening(Address, Sender<Result<Address, String>>, ListenerId),
@@ -86,7 +93,7 @@ async fn build_swarm() -> anyhow::Result<(libp2p::Swarm<MeerkatBehaviour>, PeerI
                 )),
             })
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build();
 
     let peer_id = *swarm.local_peer_id();
@@ -207,7 +214,7 @@ impl NetworkActor {
                     relay_addr,
                     reply_tx,
                 });
-                match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                match tokio::time::timeout(RELAY_RESERVATION_TIMEOUT, reply_rx).await {
                     Ok(Ok(Ok(addr))) => {
                         self.local_addrs.push(addr.clone());
                         NetworkReply::ListenSuccess { addr }
@@ -394,7 +401,7 @@ impl NetworkActor {
         if swarm.is_connected(&peer_id) {
             Self::send_to_peer(control, peer_id, msg_id, msg, event_tx).await;
         } else {
-            // Track if we are already dialing this peer to prevent duplicate dials
+            // Track if we are already dialing this `peer_id` inside `pending_sends` to prevent duplicate dials
             let is_dialing = pending_sends.contains_key(&peer_id);
             pending_sends
                 .entry(peer_id)
@@ -402,7 +409,7 @@ impl NetworkActor {
                 .push((msg_id, msg));
 
             if !is_dialing {
-                // Dial the target peer since no active dial request exists
+                // Call `swarm.dial` for the target peer since no active dial request exists
                 if let Err(e) = swarm.dial(multiaddr) {
                     let _ = event_tx.send(NetworkEvent::SendFailed {
                         msg_id,
@@ -476,7 +483,7 @@ impl NetworkActor {
                 swarm.add_external_address(address.clone());
                 let addr = Address(address.to_string());
 
-                // Check if this listen address belongs to our pending relay reservation
+                // Check if this `NewListenAddr` belongs to our `pending_relay` reservation
                 let mut matched_relay = false;
                 if let Some(PendingRelayState::Listening(_, _, expected_id)) = pending_relay {
                     if *expected_id == listener_id {
@@ -484,7 +491,7 @@ impl NetworkActor {
                     }
                 }
 
-                // If matched resolve the pending relay oneshot channel and clear the state
+                // If matched resolve the `pending_relay` oneshot channel and clear the state
                 if matched_relay {
                     if let Some(PendingRelayState::Listening(_, reply_tx, _)) = pending_relay.take()
                     {
@@ -493,7 +500,7 @@ impl NetworkActor {
                     }
                 }
 
-                // Check if this address belongs to a normal listener attempt
+                // Check if this address belongs to a `pending_listen` attempt
                 let mut matched_listen = false;
                 if let Some((expected_id, _)) = pending_listen {
                     if *expected_id == listener_id {
@@ -501,7 +508,7 @@ impl NetworkActor {
                     }
                 }
 
-                // If matched resolve the pending normal listen oneshot channel
+                // If matched resolve the `pending_listen` oneshot channel
                 if matched_listen {
                     if let Some((_, tx)) = pending_listen.take() {
                         let _ = tx.send(Ok(addr));
@@ -531,7 +538,7 @@ impl NetworkActor {
                 if let Some(circuit_listen_addr) = to_listen {
                     match swarm.listen_on(circuit_listen_addr) {
                         Ok(listener_id) => {
-                            // Transition state from Dialing to Listening with the listener ID
+                            // Transition `pending_relay` from `Dialing` to `Listening` with the `ListenerId`
                             if let Some(PendingRelayState::Dialing(relay_addr, reply_tx)) =
                                 pending_relay.take()
                             {
@@ -543,7 +550,7 @@ impl NetworkActor {
                             }
                         }
                         Err(e) => {
-                            // If listen_on failed synchronously resolve the channel with an error
+                            // If `swarm.listen_on` failed synchronously resolve the channel with an error
                             if let Some(PendingRelayState::Dialing(_, reply_tx)) =
                                 pending_relay.take()
                             {
@@ -554,7 +561,7 @@ impl NetworkActor {
                     }
                 }
 
-                // Send any queued messages that were waiting for connection establishment
+                // Send any queued messages in `pending_sends` waiting for connection establishment
                 if let Some(messages) = pending_sends.remove(&peer_id) {
                     for (msg_id, msg) in messages {
                         Self::send_to_peer(control, peer_id, msg_id, msg, event_tx).await;
@@ -566,7 +573,7 @@ impl NetworkActor {
                     peer: peer_id.to_string(),
                 });
 
-                // If connection to the expected relay closed fail the pending attempt
+                // If connection to the expected relay closed fail the `pending_relay` attempt
                 if Self::get_pending_relay_peer(pending_relay) == Some(peer_id) {
                     if let Some(state) = pending_relay.take() {
                         let tx = match state {
@@ -591,13 +598,13 @@ impl NetworkActor {
                 //println!("Identify event: {:?}", event);
             }
             libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                // Check if this connection error matches our pending relay peer
+                // Check if this `OutgoingConnectionError` matches our `pending_relay` peer
                 let matches_relay = Self::get_pending_relay_peer(pending_relay)
                     .map_or(false, |relay_peer| {
                         peer_id.map_or(false, |failed_peer| failed_peer == relay_peer)
                     });
 
-                // Fail the pending relay reservation if it matches the dial error
+                // Fail the `pending_relay` reservation if it matches the dial error
                 if matches_relay {
                     if let Some(state) = pending_relay.take() {
                         let tx = match state {
@@ -608,7 +615,7 @@ impl NetworkActor {
                     }
                 }
 
-                // Fail any message sends that were queued up waiting for this connection
+                // Fail any message sends in `pending_sends` that were queued up waiting for this connection
                 if let Some(peer_id) = peer_id {
                     if let Some(messages) = pending_sends.remove(&peer_id) {
                         for (msg_id, _) in messages {
@@ -626,7 +633,7 @@ impl NetworkActor {
             libp2p::swarm::SwarmEvent::ListenerError {
                 listener_id, error, ..
             } => {
-                // Check if this error belongs to our normal listener
+                // Check if this error belongs to our `pending_listen` attempt
                 let mut matched_listen = false;
                 if let Some((expected_id, _)) = pending_listen {
                     if *expected_id == listener_id {
@@ -639,7 +646,7 @@ impl NetworkActor {
                     }
                 }
 
-                // Check if this error belongs to our circuit relay listener
+                // Check if this error belongs to our `pending_relay` listener
                 let mut matched_relay = false;
                 if let Some(PendingRelayState::Listening(_, _, expected_id)) = pending_relay {
                     if *expected_id == listener_id {
@@ -657,7 +664,7 @@ impl NetworkActor {
                 reason,
                 ..
             } => {
-                // Check if this closed listener belongs to our relay listener
+                // Check if this closed listener belongs to our `pending_relay` listener
                 let mut matched_relay = false;
                 if let Some(PendingRelayState::Listening(_, _, expected_id)) = pending_relay {
                     if *expected_id == listener_id {
@@ -675,7 +682,7 @@ impl NetworkActor {
     }
 
     fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-        // For circuit relay addresses we need the LAST peer ID which is the destination
+        // For circuit relay addresses we need the last `PeerId` which is the destination
         // Format: /ip4/.../p2p/RELAY/p2p-circuit/p2p/DEST
         let mut peer_ids: Vec<PeerId> = addr
             .iter()
@@ -688,11 +695,11 @@ impl NetworkActor {
             })
             .collect();
 
-        // Return the last peer ID found for circuits this is the destination
+        // Return the last `PeerId` found for circuits as the destination
         peer_ids.pop()
     }
 
-    /// Extracts the peer ID of the expected relay server from a pending relay state
+    /// Extracts the `PeerId` of the expected relay server from a `PendingRelayState`
     fn get_pending_relay_peer(pending_relay: &Option<PendingRelayState>) -> Option<PeerId> {
         let relay_addr = match pending_relay.as_ref()? {
             PendingRelayState::Dialing(addr, _) => addr,
