@@ -79,8 +79,8 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         None => {
-            if args.server {
-                return Err("-s/--server requires a file (-f). Pass a .mkt file containing the services to host.".into());
+            if args.server || args.check_only {
+                return Err("Expected a .mkt file (-f).".into());
             }
             let mut manager = Manager::new();
             manager.local = args.local;
