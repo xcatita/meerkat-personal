@@ -33,3 +33,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# REPL history files
+.meerkat_history

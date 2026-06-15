@@ -65,7 +65,7 @@ pub async fn run_repl(
             let _ = std::fs::create_dir_all(proj.data_dir());
             proj.data_dir().join(".meerkat_history.txt")
         }
-        None => PathBuf::from("meerkat_history.txt"),
+        None => PathBuf::from(".meerkat_history.txt"),
     };
 
     let _ = reader.load_history(&history_path);
