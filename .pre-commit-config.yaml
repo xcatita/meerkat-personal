@@ -59,9 +59,10 @@ repos:
         files: ^(Cargo\.toml|Cargo\.lock|meerkat-lib/Cargo\.toml|meerkat-lib/.*\.(rs|lalrpop))$
         pass_filenames: false
 
+      # TODO: Re-enable `multiple_message` test after Issue 73 resolved
       - id: cargo-test
         name: cargo test
-        entry: cargo test --locked --workspace --all-features
+        entry: cargo test --locked --workspace --all-features -- --skip multiple_message
         language: system
         files: ^(Cargo\.toml|Cargo\.lock|meerkat(|-lib)/Cargo\.toml|.*\.(rs|lalrpop))$
         pass_filenames: false

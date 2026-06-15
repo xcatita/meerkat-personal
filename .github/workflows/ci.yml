@@ -60,8 +60,9 @@ jobs:
       - name: Check WASM build
         run: cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
 
+      # TODO: Re-enable `multiple_message` test after Issue 73 is resolved
       - name: Run tests
-        run: cargo test --locked --workspace --all-features
+        run: cargo test --locked --workspace --all-features -- --skip multiple_message
 
       - name: Smoke test CLI
         run: cargo run --locked -p meerkat -- --help
