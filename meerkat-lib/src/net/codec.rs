@@ -998,7 +998,7 @@ mod tests {
     fn test_codec_corrupt_payload_rejection() {
         let malformed_json = "{ \"val\": { \"Closure\": { \"params\": [";
         let res: std::result::Result<NetValue, _> = serde_json::from_str(malformed_json);
-        assert!(res.is_err() == true);
+        assert!(res.is_err());
     }
 
     /// Verify that type mismatches in JSON are rejected safely
@@ -1007,7 +1007,7 @@ mod tests {
     fn test_codec_type_mismatch_rejection() {
         let mismatched_json = "{ \"Bool\": { \"val\": \"not_a_bool\" } }";
         let res: std::result::Result<NetValue, _> = serde_json::from_str(mismatched_json);
-        assert!(res.is_err() == true);
+        assert!(res.is_err());
     }
 
     /// Verify that deeply nested AST structures do not crash the
@@ -1044,7 +1044,7 @@ mod tests {
         let net_val = NetValue::String { val: long_str };
         let mut interner = Interner::new();
         let res = decode_value(net_val, &mut interner);
-        assert!(res.is_err() == true);
+        assert!(res.is_err());
         assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
     }
 
@@ -1063,7 +1063,7 @@ mod tests {
         };
         let mut interner = Interner::new();
         let res = decode_value(net_val, &mut interner);
-        assert!(res.is_err() == true);
+        assert!(res.is_err());
         assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
     }
 
@@ -1075,7 +1075,7 @@ mod tests {
         let val = Value::String { val: long_str };
         let interner = Interner::new();
         let res = encode_value(&val, &interner);
-        assert!(res.is_err() == true);
+        assert!(res.is_err());
         assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
     }
 }

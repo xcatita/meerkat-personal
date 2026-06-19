@@ -44,13 +44,11 @@ pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, S
                     ));
                 }
             }
-            lex::Token::StrLit(val) => {
-                if val.len() > MAX_STRING_LITERAL_LENGTH {
-                    return Err(format!(
-                        "Parse error: string literal exceeds maximum length of {} characters",
-                        MAX_STRING_LITERAL_LENGTH
-                    ));
-                }
+            lex::Token::StrLit(val) if val.len() > MAX_STRING_LITERAL_LENGTH => {
+                return Err(format!(
+                    "Parse error: string literal exceeds maximum length of {} characters",
+                    MAX_STRING_LITERAL_LENGTH
+                ));
             }
             _ => {}
         }
@@ -105,13 +103,11 @@ pub fn parse_repl(input: &str, interner: &mut Interner) -> ReplParseResult {
                     ));
                 }
             }
-            lex::Token::StrLit(val) => {
-                if val.len() > MAX_STRING_LITERAL_LENGTH {
-                    return ReplParseResult::Error(format!(
-                        "Parse error: string literal exceeds maximum length of {} characters",
-                        MAX_STRING_LITERAL_LENGTH
-                    ));
-                }
+            lex::Token::StrLit(val) if val.len() > MAX_STRING_LITERAL_LENGTH => {
+                return ReplParseResult::Error(format!(
+                    "Parse error: string literal exceeds maximum length of {} characters",
+                    MAX_STRING_LITERAL_LENGTH
+                ));
             }
             _ => {}
         }
@@ -139,7 +135,7 @@ mod tests {
         let long_ident = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
         let input = format!("let {} = 42;", long_ident);
         let res = parse_string(&input, &mut interner);
-        assert!(res.is_err() == true);
+        assert!(res.is_err());
         assert!(res
             .unwrap_err()
             .contains("identifier exceeds maximum length"));
@@ -153,7 +149,7 @@ mod tests {
         let long_str = "a".repeat(MAX_STRING_LITERAL_LENGTH + 1);
         let input = format!("let x = \"{}\";", long_str);
         let res = parse_string(&input, &mut interner);
-        assert!(res.is_err() == true);
+        assert!(res.is_err());
         assert!(res
             .unwrap_err()
             .contains("string literal exceeds maximum length"));
