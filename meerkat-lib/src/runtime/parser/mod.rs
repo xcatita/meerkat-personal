@@ -191,4 +191,28 @@ mod tests {
             .unwrap_err()
             .contains("Assertion text exceeds maximum length"));
     }
+
+    /// Verify that parsing an `assert` exceeding the length limit
+    /// returns a `ParseError::User` error variant
+    #[test]
+    fn test_parse_oversized_assert_error_type() {
+        use lalrpop_util::ParseError;
+        let mut interner = Interner::new();
+        let limit = MAX_STRING_LITERAL_LENGTH;
+        let half_limit = limit / 2;
+        let repeat_count = half_limit + 1;
+        let repeated = "1+".repeat(repeat_count);
+        let long_expr = format!("{}1", repeated);
+        let input = format!("assert ({});", long_expr);
+        let mut lex_stream = Vec::new();
+        for (t, span) in lex::Token::lexer(&input).spanned() {
+            lex_stream.push((span.start, t, span.end));
+        }
+        let parser = meerkat::ProgParser::new();
+        let res = parser.parse(&input, &mut interner, lex_stream);
+        assert!(matches!(
+            res,
+            Err(ParseError::User { ref error }) if error.contains("Assertion text exceeds maximum length")
+        ));
+    }
 }

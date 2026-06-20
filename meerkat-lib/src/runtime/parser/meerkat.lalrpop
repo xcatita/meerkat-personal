@@ -109,7 +109,7 @@ ActionStmt: ActionStmt = {
         ActionStmt::Do(e)
     },
     "assert" "(" <l: @L> <e:Expr> <r: @R> ")" ";" =>? {
-        let assert_text = input[l..r].to_string();
+        let assert_text = &input[l..r];
         let limit = MAX_STRING_LITERAL_LENGTH;
         if assert_text.len() > limit {
             Err(ParseError::User {
@@ -120,7 +120,7 @@ ActionStmt: ActionStmt = {
                 ),
             })
         } else {
-            Ok(ActionStmt::Assert(e, assert_text))
+            Ok(ActionStmt::Assert(e, assert_text.to_string()))
         }
     },
     "insert"  <e: Expr> "into" <t: Ident> => {
