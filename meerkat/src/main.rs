@@ -236,6 +236,16 @@ async fn wake_ready(manager: &mut Manager, freed: HashSet<(ServiceNetId, Symbol)
     }
 }
 
+fn listen_success_addr(reply: NetworkReply) -> Result<Address, Box<dyn Error>> {
+    match reply {
+        NetworkReply::ListenSuccess { addr } => Ok(addr),
+        NetworkReply::Failure(e) => Err(e.into()),
+        NetworkReply::MessageSent { .. } | NetworkReply::LocalAddresses { .. } => {
+            Err("Unexpected reply".into())
+        }
+    }
+}
+
 async fn run_server(
     prog: Vec<Stmt>,
     remote_url_map: std::collections::HashMap<String, String>,
@@ -253,13 +263,7 @@ async fn run_server(
     let reply = net
         .handle_command(NetworkCommand::Listen { addr: listen_addr })
         .await;
-    let actual_addr = match reply {
-        NetworkReply::ListenSuccess { addr } => addr,
-        NetworkReply::Failure(e) => return Err(e.into()),
-        NetworkReply::MessageSent { .. } | NetworkReply::LocalAddresses { .. } => {
-            return Err("Unexpected reply".into())
-        }
-    };
+    let actual_addr = listen_success_addr(reply)?;
 
     let peer_id = net.local_peer_id();
     // Replace loopback/unspecified with actual node IP
@@ -551,15 +555,14 @@ async fn run_client(
         let reply = n
             .handle_command(NetworkCommand::Listen { addr: listen_addr })
             .await;
-        if let NetworkReply::ListenSuccess { addr } = reply {
-            let node_ip = manager.get_node_ip();
-            let peer_id = n.local_peer_id();
-            let addr_str = addr
-                .0
-                .replace("0.0.0.0", &node_ip)
-                .replace("127.0.0.1", &node_ip);
-            local_full_addr = Some(format!("{}/p2p/{}", addr_str, peer_id));
-        }
+        let addr = listen_success_addr(reply)?;
+        let node_ip = manager.get_node_ip();
+        let peer_id = n.local_peer_id();
+        let addr_str = addr
+            .0
+            .replace("0.0.0.0", &node_ip)
+            .replace("127.0.0.1", &node_ip);
+        local_full_addr = Some(format!("{}/p2p/{}", addr_str, peer_id));
         net = Some(n);
     }
 
@@ -636,4 +639,42 @@ async fn run_client(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meerkat_lib::net::MessageId;
+
+    #[test]
+    fn listen_success_addr_returns_bound_address() {
+        let addr = Address::new("/ip4/127.0.0.1/tcp/1234");
+
+        let actual = listen_success_addr(NetworkReply::ListenSuccess { addr: addr.clone() })
+            .expect("listen success should return the bound address");
+
+        assert_eq!(actual, addr);
+    }
+
+    #[test]
+    fn listen_success_addr_returns_listen_failure() {
+        let err = listen_success_addr(NetworkReply::Failure("bind failed".to_string()))
+            .expect_err("listen failure should become an error");
+
+        assert_eq!(err.to_string(), "bind failed");
+    }
+
+    #[test]
+    fn listen_success_addr_rejects_unexpected_replies() {
+        let local_addresses_err =
+            listen_success_addr(NetworkReply::LocalAddresses { addrs: Vec::new() })
+                .expect_err("local addresses are not a Listen success");
+        assert_eq!(local_addresses_err.to_string(), "Unexpected reply");
+
+        let message_sent_err = listen_success_addr(NetworkReply::MessageSent {
+            msg_id: MessageId(1),
+        })
+        .expect_err("message-sent replies are not a Listen success");
+        assert_eq!(message_sent_err.to_string(), "Unexpected reply");
+    }
 }
