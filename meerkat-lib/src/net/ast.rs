@@ -70,10 +70,15 @@ pub enum NetValue {
     },
     /// A standard closure value with environment
     Closure {
-        params: Vec<String>,
+        params: Vec<NetParam>,
         body: Box<NetExpr>,
         env: Vec<(String, NetValue)>,
         service_name: String,
+        /// Important: `None` indicates missing type information, not the
+        /// `unit` type. In practice, the return types for closures should
+        /// generally be `Some` type; however, this was left as an `Option`
+        /// for now for maximum flexibility as development continues.
+        return_ty: Option<NetType>,
     },
     /// An action closure value with environment and network ID
     ActionClosure {
@@ -116,6 +121,7 @@ pub enum NetExpr {
     Func {
         params: Vec<NetParam>,
         body: Box<NetExpr>,
+        return_ty: Option<NetType>,
     },
     Call {
         func: Box<NetExpr>,

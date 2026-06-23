@@ -256,7 +256,11 @@ impl<'a> AstPrinter<'a> {
                 self.print_expr(expr1, indent + 1);
                 self.print_expr(expr2, indent + 1);
             }
-            Expr::Func { params, body } => {
+            Expr::Func {
+                params,
+                body,
+                return_ty,
+            } => {
                 let params_str: Vec<String> = params
                     .iter()
                     .map(|p| {
@@ -267,7 +271,11 @@ impl<'a> AstPrinter<'a> {
                         }
                     })
                     .collect();
-                println!("Func: {{ params: {:?} }}", params_str);
+                println!(
+                    "Func: {{ params: {:?}, return_ty: {} }}",
+                    params_str,
+                    self.format_type_opt(return_ty)
+                );
                 self.print_expr(body, indent + 1);
             }
             Expr::Call { func, args } => {
@@ -359,14 +367,24 @@ impl<'a> AstPrinter<'a> {
                 params,
                 body,
                 service_name,
+                return_ty,
                 ..
             } => {
                 let service_name = *service_name;
-                let params_str: Vec<String> =
-                    params.iter().map(|p| self.format_symbol(*p)).collect();
+                let params_str: Vec<String> = params
+                    .iter()
+                    .map(|p| {
+                        if let Some(ref t) = p.ty {
+                            format!("{}: {}", self.format_symbol(p.name), t)
+                        } else {
+                            self.format_symbol(p.name)
+                        }
+                    })
+                    .collect();
                 println!(
-                    "Closure: {{ params: {:?}, service_name: {} }}",
+                    "Closure: {{ params: {:?}, return_ty: {}, service_name: {} }}",
                     params_str,
+                    self.format_type_opt(return_ty),
                     self.format_symbol(service_name)
                 );
                 self.print_expr(body, indent + 1);

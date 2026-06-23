@@ -82,10 +82,11 @@ pub async fn eval(
                     body,
                     env: closure_env,
                     service_name: closure_svc,
+                    ..
                 } => {
                     let mut new_env = closure_env.clone();
                     for (param, arg_val) in params.iter().zip(arg_vals) {
-                        new_env.push((*param, arg_val));
+                        new_env.push((param.name, arg_val));
                     }
                     eval(
                         &body,
@@ -174,7 +175,11 @@ pub async fn eval(
             }
         }
 
-        Expr::Func { params, body } => {
+        Expr::Func {
+            params,
+            body,
+            return_ty,
+        } => {
             let var_binded: HashSet<Symbol> = params.iter().map(|p| p.name).collect();
             let free_vars = body.free_var(&HashSet::new(), &var_binded);
             let captured_env: Vec<(Symbol, Value)> = env
@@ -191,10 +196,11 @@ pub async fn eval(
                 .cloned()
                 .collect();
             Ok(Value::Closure {
-                params: params.iter().map(|p| p.name).collect(),
+                params: params.clone(),
                 body: body.clone(),
                 env: captured_env,
                 service_name: ctx.service_name,
+                return_ty: return_ty.clone(),
             })
         }
 
@@ -315,6 +321,7 @@ mod tests {
                     val: Value::Int { val: 10 },
                 }),
             }),
+            return_ty: None,
         };
         let call_expr = Expr::Call {
             func: Box::new(func_expr),
@@ -374,6 +381,7 @@ mod tests {
                 expr1: Box::new(Expr::Variable { name: v4 }),
                 expr2: Box::new(Expr::Variable { name: v1 }),
             }),
+            return_ty: None,
         };
         let result = eval(&func_expr, &env, &mut ctx).await.unwrap();
         match result {

@@ -208,12 +208,11 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
             body,
             env,
             service_name,
+            return_ty,
         } => {
             let mut encoded_params = Vec::new();
             for p in params {
-                let p_str = interner.get(*p);
-                validate_identifier(p_str)?;
-                encoded_params.push(p_str.to_string());
+                encoded_params.push(encode_param(p, interner)?);
             }
             let encoded_body = Box::new(encode_expr(body, interner)?);
             let mut encoded_env = Vec::new();
@@ -224,11 +223,16 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
             }
             let service_str = interner.get(*service_name);
             validate_identifier(service_str)?;
+            let encoded_return_ty = match return_ty {
+                Some(t) => Some(encode_type(t)?),
+                None => None,
+            };
             Ok(NetValue::Closure {
                 params: encoded_params,
                 body: encoded_body,
                 env: encoded_env,
                 service_name: service_str.to_string(),
+                return_ty: encoded_return_ty,
             })
         }
         Value::ActionClosure {
@@ -276,11 +280,12 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
             body,
             env,
             service_name,
+            return_ty,
         } => {
-            for p in &params {
-                validate_identifier(p)?;
+            let mut decoded_params = Vec::new();
+            for p in params {
+                decoded_params.push(decode_param(p, interner)?);
             }
-            let decoded_params = params.into_iter().map(|p| interner.insert(&p)).collect();
             let decoded_body = Box::new(decode_expr(*body, interner)?);
             let mut decoded_env = Vec::new();
             for (k, v) in env {
@@ -289,11 +294,16 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
             }
             validate_identifier(&service_name)?;
             let decoded_service = interner.insert(&service_name);
+            let decoded_return_ty = match return_ty {
+                Some(t) => Some(decode_type(t)?),
+                None => None,
+            };
             Ok(Value::Closure {
                 params: decoded_params,
                 body: decoded_body,
                 env: decoded_env,
                 service_name: decoded_service,
+                return_ty: decoded_return_ty,
             })
         }
         NetValue::ActionClosure {
@@ -368,15 +378,24 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
             expr1: Box::new(encode_expr(expr1, interner)?),
             expr2: Box::new(encode_expr(expr2, interner)?),
         }),
-        Expr::Func { params, body } => {
+        Expr::Func {
+            params,
+            body,
+            return_ty,
+        } => {
             let mut encoded_params = Vec::new();
             for p in params {
                 encoded_params.push(encode_param(p, interner)?);
             }
             let encoded_body = Box::new(encode_expr(body, interner)?);
+            let encoded_return_ty = match return_ty {
+                Some(t) => Some(encode_type(t)?),
+                None => None,
+            };
             Ok(NetExpr::Func {
                 params: encoded_params,
                 body: encoded_body,
+                return_ty: encoded_return_ty,
             })
         }
         Expr::Call { func, args } => {
@@ -510,15 +529,24 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
             expr1: Box::new(decode_expr(*expr1, interner)?),
             expr2: Box::new(decode_expr(*expr2, interner)?),
         }),
-        NetExpr::Func { params, body } => {
+        NetExpr::Func {
+            params,
+            body,
+            return_ty,
+        } => {
             let mut decoded_params = Vec::new();
             for p in params {
                 decoded_params.push(decode_param(p, interner)?);
             }
             let decoded_body = Box::new(decode_expr(*body, interner)?);
+            let decoded_return_ty = match return_ty {
+                Some(t) => Some(decode_type(t)?),
+                None => None,
+            };
             Ok(Expr::Func {
                 params: decoded_params,
                 body: decoded_body,
+                return_ty: decoded_return_ty,
             })
         }
         NetExpr::Call { func, args } => {
@@ -897,10 +925,14 @@ mod tests {
         let service = interner_orig.insert("my_service");
 
         let original_value = Value::Closure {
-            params: vec![param_name],
+            params: vec![Param {
+                name: param_name,
+                ty: None,
+            }],
             body: Box::new(body),
             env: vec![(env_key, env_val)],
             service_name: service,
+            return_ty: None,
         };
 
         let encoded = encode_value(&original_value, &interner_orig).unwrap();
@@ -1022,6 +1054,7 @@ mod tests {
             body: Box::new(Expr::Literal {
                 val: Value::Int { val: 9 },
             }),
+            return_ty: None,
         };
         run_expr_test(&func_expr, &interner);
 
@@ -1036,6 +1069,7 @@ mod tests {
             body: Box::new(Expr::Literal {
                 val: Value::Int { val: 9 },
             }),
+            return_ty: None,
         };
         let call_expr = Expr::Call {
             func: Box::new(func_expr),
@@ -1240,12 +1274,16 @@ mod tests {
     fn test_codec_decode_oversized_identifier() {
         let long_ident = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
         let net_val = NetValue::Closure {
-            params: vec![long_ident],
+            params: vec![NetParam {
+                name: long_ident,
+                ty: None,
+            }],
             body: Box::new(NetExpr::Literal {
                 val: NetValue::Int { val: 0 },
             }),
             env: vec![],
             service_name: "test".to_string(),
+            return_ty: None,
         };
         let mut interner = Interner::new();
         let res = decode_value(net_val, &mut interner);

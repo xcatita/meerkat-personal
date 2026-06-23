@@ -328,7 +328,7 @@ Expr: Expr = {
     #[precedence(level="8")] #[assoc(side="left")]
     "fn" <params:Params> "=>" <e:Expr> => 
     Expr::Func {
-        params, body: Box::new(e)
+        params, body: Box::new(e), return_ty: None
     },
     "select" <mut cols: (<Ident> ",")*> <c: Ident?> "from" <t: Ident> "where" <cond: Expr> => Expr::Select {
         table_name: t,

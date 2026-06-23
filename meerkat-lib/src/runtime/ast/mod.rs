@@ -91,10 +91,11 @@ pub enum Value {
         val: String,
     },
     Closure {
-        params: Vec<Symbol>,
+        params: Vec<Param>,
         body: Box<Expr>,
         env: Vec<(Symbol, Value)>,
         service_name: Symbol,
+        return_ty: Option<Type>,
     },
     ActionClosure {
         stmts: Vec<ActionStmt>,
@@ -144,6 +145,7 @@ pub enum Expr {
     Func {
         params: Vec<Param>,
         body: Box<Expr>,
+        return_ty: Option<Type>,
     },
     Call {
         func: Box<Expr>,
@@ -255,12 +257,27 @@ impl Display for Value {
             Value::Bool { val } => write!(f, "{}", val),
             Value::String { val } => write!(f, "\"{}\"", val),
             Value::Closure {
-                params, body, env, ..
+                params,
+                body,
+                env,
+                return_ty,
+                ..
             } => {
                 let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
                 let env_str: Vec<String> =
                     env.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
-                write!(f, "fn({})[{:?}]{{{}}}", params_str.join(","), env_str, body)
+                if let Some(ref ty) = return_ty {
+                    write!(
+                        f,
+                        "fn({}) -> {}[{:?}]{{{}}}",
+                        params_str.join(","),
+                        ty,
+                        env_str,
+                        body
+                    )
+                } else {
+                    write!(f, "fn({})[{:?}]{{{}}}", params_str.join(","), env_str, body)
+                }
             }
             Value::ActionClosure {
                 stmts,
@@ -302,9 +319,17 @@ impl Display for Expr {
             Expr::If { cond, expr1, expr2 } => {
                 write!(f, "if {} then {} else {}", cond, expr1, expr2)
             }
-            Expr::Func { params, body } => {
+            Expr::Func {
+                params,
+                body,
+                return_ty,
+            } => {
                 let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
-                write!(f, "fn({})[{}]", params_str.join(","), body)
+                if let Some(ref ty) = return_ty {
+                    write!(f, "fn({}) -> {}[{}]", params_str.join(","), ty, body)
+                } else {
+                    write!(f, "fn({})[{}]", params_str.join(","), body)
+                }
             }
             Expr::Call { func, args } => write!(
                 f,

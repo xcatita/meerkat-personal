@@ -3,7 +3,7 @@ service type_suite {
     def d_int: int = 42;
     def d_str: string = "hello";
     def d_bool: bool = true;
-    def d_unit: unit = 42;
+    def d_unit_func: () -> unit = fn () => true;
 
     // Functions with primitive and tuple type signatures
     def d_func: (int) -> string = fn (a: int) => "res";
@@ -49,7 +49,7 @@ service type_suite {
     let l_int: int = 100;
     let l_str: string = "test";
     let l_bool: bool = false;
-    let l_unit: unit = 100;
+    let l_unit_func: () -> unit = fn () => true;
 
     let l_func: () -> bool = fn () => true;
 

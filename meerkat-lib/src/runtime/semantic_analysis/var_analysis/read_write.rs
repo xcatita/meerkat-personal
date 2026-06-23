@@ -53,7 +53,7 @@ impl Expr {
                 free_vars.extend(expr2.free_var(reactive_names, var_binded));
                 free_vars
             }
-            Expr::Func { params, body } => {
+            Expr::Func { params, body, .. } => {
                 let mut new_binds = var_binded.clone();
                 new_binds.extend(params.iter().map(|p| p.name));
                 body.free_var(reactive_names, &new_binds)
