@@ -3,7 +3,7 @@ service type_suite {
     def d_int: int = 42;
     def d_str: string = "hello";
     def d_bool: bool = true;
-    def d_unit_func: () -> unit = fn () => true;
+    def d_unit_func: () -> unit = fn () => {};
 
     // Functions with primitive and tuple type signatures
     def d_func: (int) -> string = fn (a: int) => "res";
@@ -49,7 +49,7 @@ service type_suite {
     let l_int: int = 100;
     let l_str: string = "test";
     let l_bool: bool = false;
-    let l_unit_func: () -> unit = fn () => true;
+    let l_unit_func: () -> unit = fn () => {};
 
     let l_func: () -> bool = fn () => true;
 
@@ -92,7 +92,7 @@ service type_suite {
     assert(l_func());
     assert(l_single_param(5) == 5);
     assert(l_arrow(1)("a"));
-    assert(l_mixed(1, "untyped"));
+    assert(l_mixed(1, true));
 
     // Verify exhaustive nested cases
     assert(l_non_nested(1));
