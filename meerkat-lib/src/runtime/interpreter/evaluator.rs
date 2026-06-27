@@ -15,6 +15,7 @@ pub enum EvalError {
     WaitDieAbort(String),
     WaitOn(Symbol, Symbol),
     AssertionError(String),
+    RuntimeError(String),
 }
 
 /// Implement the `Display` trait for the `EvalError` type
@@ -41,6 +42,7 @@ impl std::fmt::Display for EvalError {
                 write!(f, "Wait-die wait on Symbol({})::Symbol({})", service, var)
             }
             EvalError::AssertionError(s) => write!(f, "Assertion failed: {}", s),
+            EvalError::RuntimeError(s) => write!(f, "Runtime error: {}", s),
         }
     }
 }
@@ -130,7 +132,19 @@ pub async fn eval(
                     Ok(Value::Int { val: v1 * v2 })
                 }
                 (BinOp::Div, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
-                    Ok(Value::Int { val: v1 / v2 })
+                    // NOTE: Division by zero and division overflow (i32::MIN / -1) are the only
+                    // integer arithmetic operations that panic in Rust release mode.
+                    // If a modulo (%) operator is ever implemented in the future, it must
+                    // also include these identical bounds checks (x % 0 and i32::MIN % -1)
+                    // to prevent panics.
+                    let val = v1.checked_div(v2).ok_or_else(|| {
+                        EvalError::RuntimeError(if v2 == 0 {
+                            "Division by zero".to_string()
+                        } else {
+                            "Integer overflow".to_string()
+                        })
+                    })?;
+                    Ok(Value::Int { val })
                 }
                 (BinOp::Eq, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
                     Ok(Value::Bool { val: v1 == v2 })
@@ -397,6 +411,54 @@ mod tests {
                 assert_eq!(captured_env[0].1, Value::Int { val: 1 });
             }
             _ => panic!("Expected Closure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_division_by_zero_returns_runtime_error() {
+        let mut manager = Manager::new(Interner::new());
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: Symbol::empty(),
+            txn: None,
+        };
+        let expr = Expr::Binop {
+            op: BinOp::Div,
+            expr1: Box::new(Expr::Literal {
+                val: Value::Int { val: 42 },
+            }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 0 },
+            }),
+        };
+        let result = eval(&expr, &[], &mut ctx).await;
+        match result {
+            Err(EvalError::RuntimeError(ref s)) => assert_eq!(s, "Division by zero"),
+            other => panic!("Expected Err(EvalError::RuntimeError), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_division_overflow_returns_runtime_error() {
+        let mut manager = Manager::new(Interner::new());
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: Symbol::empty(),
+            txn: None,
+        };
+        let expr = Expr::Binop {
+            op: BinOp::Div,
+            expr1: Box::new(Expr::Literal {
+                val: Value::Int { val: i32::MIN },
+            }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: -1 },
+            }),
+        };
+        let result = eval(&expr, &[], &mut ctx).await;
+        match result {
+            Err(EvalError::RuntimeError(ref s)) => assert_eq!(s, "Integer overflow"),
+            other => panic!("Expected Err(EvalError::RuntimeError), got {:?}", other),
         }
     }
 }
