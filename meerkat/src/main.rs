@@ -48,6 +48,11 @@ struct Args {
     /// Emit AST to `stdout`
     #[arg(long = "ast", default_value_t = false)]
     ast: bool,
+
+    /// Watch mode: subscribe to cross-service dependencies and print change
+    /// notifications asynchronously as they arrive (issue #24)
+    #[arg(long = "watch", default_value_t = false)]
+    watch: bool,
 }
 
 #[tokio::main]
@@ -103,13 +108,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             if args.server {
                 run_server(prog, remote_url_map, args.port, args.local, interner).await
             } else {
-                run_client(prog, file, remote_url_map, args.local, interner).await
+                run_client(prog, file, remote_url_map, args.local, args.watch, interner).await
             }
         }
         None => {
-            if args.server || args.check_only || args.ast {
+            if args.server || args.check_only || args.ast || args.watch {
                 return Err(
-                    "Expected a .mkt file (-f) for --server, --check, or --ast mode.".into(),
+                    "Expected a .mkt file (-f) for --server, --check, --ast, or --watch mode."
+                        .into(),
                 );
             }
             let mut manager = Manager::new(interner);
@@ -515,6 +521,63 @@ async fn run_server(
                     // abort just released.
                     wake_ready(&mut manager, freed).await;
                 }
+                MeerkatMessage::RequestUpdates {
+                    service,
+                    member,
+                    listener_service,
+                    listener_def,
+                    reply_to,
+                    ..
+                } => {
+                    // #24: validate + intern wire names through codec (the sole
+                    // interning authority for network data); skip on bad input.
+                    let (service_sym, member_sym, listener_def_sym) =
+                        match codec::decode_request_updates(
+                            &service,
+                            &member,
+                            &listener_def,
+                            &mut manager.interner,
+                        ) {
+                            Ok(syms) => syms,
+                            Err(_) => continue,
+                        };
+                    manager
+                        .handle_request_updates(
+                            service_sym,
+                            member_sym,
+                            ServiceNetId(listener_service),
+                            listener_def_sym,
+                            reply_to,
+                        )
+                        .await;
+                }
+                MeerkatMessage::Update {
+                    listener_service,
+                    listener_def,
+                    source_service,
+                    member,
+                    value,
+                } => {
+                    // #24: validate + intern wire names through codec; skip on bad input.
+                    let (listener_def_sym, source_sym, member_sym) = match codec::decode_update(
+                        &listener_def,
+                        &source_service,
+                        &member,
+                        &mut manager.interner,
+                    ) {
+                        Ok(syms) => syms,
+                        Err(_) => continue,
+                    };
+                    manager
+                        .handle_update(
+                            ServiceNetId(listener_service),
+                            listener_def_sym,
+                            source_sym,
+                            member_sym,
+                            value,
+                        )
+                        .await;
+                }
                 MeerkatMessage::Ping { .. }
                 | MeerkatMessage::Pong { .. }
                 | MeerkatMessage::Announce { .. }
@@ -538,15 +601,17 @@ async fn run_client(
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
+    watch: bool,
     interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new(interner);
     manager.local = local;
 
-    // Start network if we have remote imports
+    // Start the network if we have remote imports, or always in watch mode
+    // (watch needs the network to receive change notifications).
     let mut net: Option<NetworkActor> = None;
     let mut local_full_addr: Option<String> = None;
-    if !remote_url_map.is_empty() {
+    if watch || !remote_url_map.is_empty() {
         let mut n = NetworkActor::new(NodeType::Server)
             .await
             .map_err(|e| format!("Network error: {}", e))?;
@@ -589,17 +654,20 @@ async fn run_client(
                 service_name,
                 ref stmts,
             } => {
-                manager
-                    .execute_action(service_name, stmts)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "Test failed in '{}': {}",
-                            manager.interner.get(service_name),
-                            e
-                        )
-                    })?;
-                println!("@test({}) passed", manager.interner.get(service_name));
+                // Watch mode only observes; it does not run @test actions.
+                if !watch {
+                    manager
+                        .execute_action(service_name, stmts)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "Test failed in '{}': {}",
+                                manager.interner.get(service_name),
+                                e
+                            )
+                        })?;
+                    println!("@test({}) passed", manager.interner.get(service_name));
+                }
             }
             &Stmt::Import {
                 ref path,
@@ -635,6 +703,52 @@ async fn run_client(
             }
             &Stmt::ActionStmt(_) => {}
             &Stmt::Update { .. } | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
+        }
+    }
+
+    if watch {
+        println!("Watching for changes, press Ctrl+C to stop...");
+        loop {
+            let msg = manager
+                .network
+                .as_mut()
+                .and_then(|n| n.try_recv_event())
+                .and_then(|ev| match ev {
+                    NetworkEvent::MessageReceived { msg, .. } => Some(msg),
+                    _ => None,
+                });
+            if let Some(MeerkatMessage::Update {
+                listener_service,
+                listener_def,
+                source_service,
+                member,
+                value,
+            }) = msg
+            {
+                if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
+                    println!("[update] {}.{} = {:?}", source_service, member, parsed);
+                }
+                let lid = ServiceNetId(listener_service);
+                // #24: validate + intern wire names through codec; skip on bad input.
+                let (def_sym, source_sym, member_sym) = match codec::decode_update(
+                    &listener_def,
+                    &source_service,
+                    &member,
+                    &mut manager.interner,
+                ) {
+                    Ok(syms) => syms,
+                    Err(_) => continue,
+                };
+                manager
+                    .handle_update(lid.clone(), def_sym, source_sym, member_sym, value)
+                    .await;
+                if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
+                    if let Some(vs) = svc.vars.get(&def_sym) {
+                        println!("          -> {} = {:?}", listener_def, vs.value);
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
 

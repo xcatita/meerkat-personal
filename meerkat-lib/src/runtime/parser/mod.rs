@@ -36,13 +36,11 @@ pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, S
     let mut lex_stream = Vec::new();
     for (t, span) in lex::Token::lexer(input).spanned() {
         match t {
-            lex::Token::Ident(name) => {
-                if name.len() > MAX_IDENTIFIER_LENGTH {
-                    return Err(format!(
-                        "Parse error: identifier exceeds maximum length of {} characters",
-                        MAX_IDENTIFIER_LENGTH
-                    ));
-                }
+            lex::Token::Ident(name) if name.len() > MAX_IDENTIFIER_LENGTH => {
+                return Err(format!(
+                    "Parse error: identifier exceeds maximum length of {} characters",
+                    MAX_IDENTIFIER_LENGTH
+                ));
             }
             lex::Token::StrLit(val) if val.len() > MAX_STRING_LITERAL_LENGTH => {
                 return Err(format!(
@@ -95,13 +93,11 @@ pub fn parse_repl(input: &str, interner: &mut Interner) -> ReplParseResult {
     let mut lex_stream = Vec::new();
     for (t, span) in lex::Token::lexer(input).spanned() {
         match t {
-            lex::Token::Ident(name) => {
-                if name.len() > MAX_IDENTIFIER_LENGTH {
-                    return ReplParseResult::Error(format!(
-                        "Parse error: identifier exceeds maximum length of {} characters",
-                        MAX_IDENTIFIER_LENGTH
-                    ));
-                }
+            lex::Token::Ident(name) if name.len() > MAX_IDENTIFIER_LENGTH => {
+                return ReplParseResult::Error(format!(
+                    "Parse error: identifier exceeds maximum length of {} characters",
+                    MAX_IDENTIFIER_LENGTH
+                ));
             }
             lex::Token::StrLit(val) if val.len() > MAX_STRING_LITERAL_LENGTH => {
                 return ReplParseResult::Error(format!(

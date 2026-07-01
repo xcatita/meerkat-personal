@@ -4,6 +4,9 @@ use kameo::Reply;
 
 /// Messages TO Network Actor (from Manager)
 #[derive(Debug)]
+// Command payloads intentionally carry a full MeerkatMessage; boxing buys
+// nothing for these short-lived channel messages.
+#[allow(clippy::large_enum_variant)]
 pub enum NetworkCommand {
     SendMessage { addr: Address, msg: MeerkatMessage },
     Listen { addr: Address },

@@ -8,7 +8,7 @@ use crate::net::ast::{
     NetActionStmt, NetBinOp, NetExpr, NetField, NetParam, NetTableType, NetType, NetUnOp, NetValue,
 };
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
-use crate::runtime::interner::Interner;
+use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{MAX_IDENTIFIER_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH};
 use crate::runtime::tt::{Param, TupleType, Type};
 
@@ -17,6 +17,23 @@ fn validate_identifier(s: &str) -> Result<()> {
         return Err(Error::LimitExceeded(format!(
             "identifier exceeds maximum length of {} characters",
             MAX_IDENTIFIER_LENGTH
+        )));
+    }
+    // Match the lexer's identifier rule ([A-Za-z_][A-Za-z0-9_]*) so a name
+    // arriving over the wire is rejected unless the parser would also accept
+    // it locally. Without this, length-valid but non-identifier strings
+    // (empty, whitespace, punctuation) could still be interned from the wire.
+    let mut chars = s.chars();
+    let valid = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(Error::LimitExceeded(format!(
+            "invalid identifier (must match [A-Za-z_][A-Za-z0-9_]*): {:?}",
+            s
         )));
     }
     Ok(())
@@ -30,6 +47,51 @@ fn validate_string_literal(s: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// #24: validate and intern the identifier fields of a `RequestUpdates`
+/// message arriving over the wire. Per the zero-trust boundary, all interning
+/// of network-sourced names happens here in codec (never in the manager or
+/// main), after `validate_identifier`. `listener_service` and `reply_to` are
+/// network addresses, not identifiers, so they are not interned here.
+///
+/// Returns `(service, member, listener_def)` as interned `Symbol`s.
+pub fn decode_request_updates(
+    service: &str,
+    member: &str,
+    listener_def: &str,
+    interner: &mut Interner,
+) -> Result<(Symbol, Symbol, Symbol)> {
+    validate_identifier(service)?;
+    validate_identifier(member)?;
+    validate_identifier(listener_def)?;
+    Ok((
+        interner.insert(service),
+        interner.insert(member),
+        interner.insert(listener_def),
+    ))
+}
+
+/// #24: validate and intern the identifier fields of an `Update` message
+/// arriving over the wire (the `value` is decoded separately via
+/// `decode_value`). As with `decode_request_updates`, all interning of
+/// network-sourced names happens here after validation.
+///
+/// Returns `(listener_def, source_service, member)` as interned `Symbol`s.
+pub fn decode_update(
+    listener_def: &str,
+    source_service: &str,
+    member: &str,
+    interner: &mut Interner,
+) -> Result<(Symbol, Symbol, Symbol)> {
+    validate_identifier(listener_def)?;
+    validate_identifier(source_service)?;
+    validate_identifier(member)?;
+    Ok((
+        interner.insert(listener_def),
+        interner.insert(source_service),
+        interner.insert(member),
+    ))
 }
 
 /// Encode a runtime `Type` using recursion depth accumulator
@@ -1274,6 +1336,31 @@ mod tests {
         let res = decode_value(net_val, &mut interner);
         assert!(res.is_err());
         assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
+    }
+
+    /// #24: verify the codec rejects wire identifiers that the lexer would not
+    /// accept locally (whitespace, punctuation, leading digit, empty), so a
+    /// remote peer cannot grow the interner with non-identifier strings.
+    #[test]
+    fn test_codec_decode_rejects_non_identifier() {
+        let mut interner = Interner::new();
+        for bad in ["bad name", "bad!name", "1leading", "", "has.dot", "sp ace"] {
+            let res = decode_request_updates(bad, "member", "ldef", &mut interner);
+            assert!(
+                res.is_err(),
+                "decode_request_updates should reject service {:?}",
+                bad
+            );
+            let res = decode_update("ldef", bad, "member", &mut interner);
+            assert!(
+                res.is_err(),
+                "decode_update should reject source_service {:?}",
+                bad
+            );
+        }
+        // A well-formed identifier is accepted.
+        assert!(decode_request_updates("svc", "y", "z", &mut interner).is_ok());
+        assert!(decode_update("z", "svc", "y", &mut interner).is_ok());
     }
 
     /// Verify that encoding a value with an oversized string

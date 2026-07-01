@@ -20,6 +20,11 @@ pub struct Service {
     pub vars: HashMap<Symbol, VarState>,
     pub defs: HashMap<Symbol, Expr>, // original def expressions for re-evaluation
     pub dep: DependAnalysis,         // dependency graph + topo order
+    /// #24: who depends on each member: member -> {(listener service id, def)}.
+    pub listeners: HashMap<Symbol, HashSet<(ServiceNetId, Symbol)>>,
+    /// #24: cached values of each def's cross-service deps:
+    /// def -> {(source service, member) -> value}.
+    pub dep_cache: HashMap<Symbol, HashMap<(Symbol, Symbol), Value>>,
 }
 
 /// A remote request parked on a variable's wait queue because the requesting
@@ -83,6 +88,13 @@ pub struct Manager {
     pub local: bool,
     /// String interner
     pub interner: Interner,
+    /// #24: transient cache consulted during a reactive recompute. Holds the
+    /// (service, member) -> value map for the def currently being recomputed so
+    /// MemberAccess resolves from cache instead of a (possibly remote) lookup.
+    pub reactive_cache: Option<HashMap<(Symbol, Symbol), Value>>,
+    /// #24: reply address for each remote listener, keyed by the listener's
+    /// ServiceNetId, so the owner can route Updates back to it.
+    pub listener_addrs: HashMap<ServiceNetId, String>,
 }
 
 impl Manager {
@@ -98,6 +110,8 @@ impl Manager {
             local_address: None,
             local: false,
             interner,
+            reactive_cache: None,
+            listener_addrs: HashMap::new(),
         }
     }
 
@@ -225,6 +239,8 @@ impl Manager {
                 vars: HashMap::new(),
                 defs: HashMap::new(),
                 dep,
+                listeners: HashMap::new(),
+                dep_cache: HashMap::new(),
             },
         );
 
@@ -296,12 +312,53 @@ impl Manager {
             }
         }
 
-        // code for handling transaction errors copied over from execute_action_with_txn
-
+        // #87: commit on success, abort and roll back on failure (pattern from
+        // execute_action_with_txn).
         if init_error.is_none() {
             self.apply_committed_writes(&txn).await;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 let _ = self.send_commit(addr, &txn.id).await;
+            }
+
+            // #24: now that init succeeded, register listener edges so a change to
+            // a member notifies the defs that depend on it. Same-service deps come
+            // from dep_graph; cross-service deps come from each def's MemberAccess refs, where a local
+            // owner is wired in-process and a remote owner is subscribed over the
+            // wire. Only runs on the success path: a rolled-back service must not
+            // register listeners.
+            if let Some(s) = self.services.get(&svc_name) {
+                let this_id = s.id.clone();
+                let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
+                for (def_name, deps) in &s.dep.dep_graph {
+                    if s.defs.contains_key(def_name) {
+                        for dep_member in deps {
+                            edges.push((svc_name, *dep_member, *def_name));
+                        }
+                    }
+                }
+                // #24: cross-service deps, derived from each stored def
+                // expression (dep_remote removed: these are just the keys of
+                // dep_cache, recomputed here from the def's MemberAccess refs).
+                for (def_name, expr) in &s.defs {
+                    for (owner, member) in expr.cross_service_deps() {
+                        edges.push((owner, member, *def_name));
+                    }
+                }
+                for (owner, member, listener_def) in edges {
+                    if self.services.contains_key(&owner) {
+                        if let Some(owner_svc) = self.services.get_mut(&owner) {
+                            owner_svc
+                                .listeners
+                                .entry(member)
+                                .or_default()
+                                .insert((this_id.clone(), listener_def));
+                        }
+                    } else {
+                        // remote owner: subscribe over the wire so future changes push.
+                        self.subscribe_remote(owner, member, this_id.clone(), listener_def)
+                            .await;
+                    }
+                }
             }
         } else {
             // Execution failed: discard buffered writes and abort participants.
@@ -493,110 +550,408 @@ impl Manager {
     }
 
     async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
-        // collect defs that need re-evaluation in topo order
-        let topo_order: Vec<Symbol> = self
-            .services
-            .get(&service_name)
-            .map(|s| s.dep.topo_order.clone())
-            .unwrap_or_default();
+        // #24: event-driven reactivity over the listener graph. A change to a
+        // member notifies its listeners. For each listener we resolve its
+        // service id to a local service: Some means a local listener, which we
+        // recompute from current values (and cached cross-service deps) and, if
+        // it changes, push back onto the worklist to cascade; None means the
+        // listener lives on another node, which we notify over the wire via
+        // emit_update.
+        let mut worklist: Vec<(Symbol, Symbol)> = vec![(service_name, changed_var)];
 
-        for def_name in topo_order {
-            let needs_update = self
+        while let Some((svc, member)) = worklist.pop() {
+            let listeners: Vec<(ServiceNetId, Symbol)> = self
                 .services
-                .get(&service_name)
-                .and_then(|s| s.dep.dep_vars.get(&def_name))
-                .map(|dep_vars| dep_vars.contains(&changed_var))
-                .unwrap_or(false);
+                .get(&svc)
+                .and_then(|s| s.listeners.get(&member))
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default();
 
-            let is_def = self
-                .services
-                .get(&service_name)
-                .map(|s| s.defs.contains_key(&def_name))
-                .unwrap_or(false);
-
-            if needs_update && is_def {
-                // build env from current var values
-                let expr = self
+            for (listener_id, listener_def) in listeners {
+                let listener_svc = self
                     .services
-                    .get(&service_name)
-                    .and_then(|s| s.defs.get(&def_name))
-                    .cloned();
+                    .iter()
+                    .find(|(_, s)| s.id == listener_id)
+                    .map(|(name, _)| *name);
 
-                if let Some(expr) = expr {
-                    let env: Vec<(Symbol, Value)> = self
-                        .services
-                        .get(&service_name)
-                        .map(|s| s.vars.iter().map(|(k, v)| (*k, v.value.clone())).collect())
-                        .unwrap_or_default();
-
-                    let value = match eval(
-                        &expr,
-                        &env,
-                        &mut EvalContext {
-                            manager: self,
-                            service_name,
-                            txn: None,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Propagation is best-effort; durable retry of failed
-                            // updates is tracked under issue #24 (async updates).
-                            log::warn!(
-                                "propagation of def '{}' failed: {}",
-                                self.interner.get(def_name),
-                                e
-                            );
-                            continue;
+                match listener_svc {
+                    Some(lsvc) => {
+                        if self.recompute_def(lsvc, listener_def).await {
+                            worklist.push((lsvc, listener_def));
                         }
-                    };
-
-                    if let Some(service) = self.services.get_mut(&service_name) {
-                        if let Some(var_state) = service.vars.get_mut(&def_name) {
-                            var_state.value = value;
-                        }
+                    }
+                    None => {
+                        self.emit_update(&listener_id, listener_def, svc, member)
+                            .await;
                     }
                 }
             }
         }
     }
 
+    /// #24: recompute `def` in `svc` from current values, seeding the reactive
+    /// cache with this def's cached cross-service deps so MemberAccess resolves
+    /// from cache instead of a (possibly remote) lookup. Returns whether the
+    /// stored value changed.
+    async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
+        let expr = match self
+            .services
+            .get(&svc)
+            .and_then(|s| s.defs.get(&def))
+            .cloned()
+        {
+            Some(e) => e,
+            None => {
+                log::warn!(
+                    "recompute_def: def '{}' not found in service '{}'",
+                    self.interner.get(def),
+                    self.interner.get(svc)
+                );
+                return false;
+            }
+        };
+        let env: Vec<(Symbol, Value)> = self
+            .services
+            .get(&svc)
+            .map(|s| s.vars.iter().map(|(k, v)| (*k, v.value.clone())).collect())
+            .unwrap_or_default();
+        let cache = self
+            .services
+            .get(&svc)
+            .and_then(|s| s.dep_cache.get(&def))
+            .cloned()
+            .unwrap_or_default();
+
+        self.reactive_cache = Some(cache);
+        let result = eval(
+            &expr,
+            &env,
+            &mut EvalContext {
+                manager: self,
+                service_name: svc,
+                txn: None,
+            },
+        )
+        .await;
+        // The reactive cache is only valid for the single recompute above (its
+        // entries are this def's cached cross-service deps), so clear it before
+        // returning to avoid leaking stale entries into later evaluations.
+        self.reactive_cache = None;
+
+        let value = match result {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "propagation of def '{}' failed: {}",
+                    self.interner.get(def),
+                    e
+                );
+                return false;
+            }
+        };
+
+        match self
+            .services
+            .get_mut(&svc)
+            .and_then(|s| s.vars.get_mut(&def))
+        {
+            Some(var_state) => {
+                let differs = var_state.value != value;
+                var_state.value = value;
+                differs
+            }
+            None => {
+                log::warn!(
+                    "recompute_def: def '{}' in service '{}' disappeared after recompute",
+                    self.interner.get(def),
+                    self.interner.get(svc)
+                );
+                false
+            }
+        }
+    }
+
+    /// #24: fire-and-forget send (no reply awaited).
+    async fn send_oneway(&mut self, addr: Address, msg: MeerkatMessage) {
+        if let Some(net) = self.network.as_mut() {
+            net.handle_command(NetworkCommand::SendMessage { addr, msg })
+                .await;
+        }
+    }
+
+    /// #24: send the current value of `svc.member` to a remote listener.
+    async fn emit_update(
+        &mut self,
+        listener_id: &ServiceNetId,
+        listener_def: Symbol,
+        svc: Symbol,
+        member: Symbol,
+    ) {
+        let reply_to = match self.listener_addrs.get(listener_id) {
+            Some(a) => a.clone(),
+            None => {
+                log::warn!(
+                    "emit_update: no reply address for listener '{}'",
+                    listener_id.0
+                );
+                return;
+            }
+        };
+        let value = match self
+            .services
+            .get(&svc)
+            .and_then(|s| s.vars.get(&member))
+            .map(|vs| vs.value.clone())
+        {
+            Some(v) => v,
+            None => {
+                log::warn!(
+                    "emit_update: member '{}' not found in service '{}'",
+                    self.interner.get(member),
+                    self.interner.get(svc)
+                );
+                return;
+            }
+        };
+        let net_val = match codec::encode_value(&value, &self.interner) {
+            Ok(nv) => nv,
+            Err(e) => {
+                log::warn!(
+                    "emit_update: failed to encode value for '{}.{}': {}",
+                    self.interner.get(svc),
+                    self.interner.get(member),
+                    e
+                );
+                return;
+            }
+        };
+        let msg = MeerkatMessage::Update {
+            listener_service: listener_id.0.clone(),
+            listener_def: self.interner.get(listener_def).to_string(),
+            source_service: self.interner.get(svc).to_string(),
+            member: self.interner.get(member).to_string(),
+            value: net_val,
+        };
+        self.send_oneway(Address::new(&reply_to), msg).await;
+    }
+
+    /// #24: subscribe `this_id.listener_def` as a listener on remote `owner.member`.
+    async fn subscribe_remote(
+        &mut self,
+        owner: Symbol,
+        member: Symbol,
+        this_id: ServiceNetId,
+        listener_def: Symbol,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SUB_ID: AtomicU64 = AtomicU64::new(1);
+        let addr = match self.remote_addr(owner) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let reply_to = self.local_reply_addr().await;
+        let request_id = NEXT_SUB_ID.fetch_add(1, Ordering::SeqCst);
+        let msg = MeerkatMessage::RequestUpdates {
+            request_id,
+            service: self.interner.get(owner).to_string(),
+            member: self.interner.get(member).to_string(),
+            listener_service: this_id.0,
+            listener_def: self.interner.get(listener_def).to_string(),
+            reply_to,
+        };
+        self.send_oneway(addr, msg).await;
+    }
+
+    /// #24 owner side: register a remote listener on `service.member` and reply
+    /// with the current value as an initial `Update` so it starts in sync.
+    pub async fn handle_request_updates(
+        &mut self,
+        service_sym: Symbol,
+        member_sym: Symbol,
+        listener_id: ServiceNetId,
+        listener_def_sym: Symbol,
+        reply_to: String,
+    ) {
+        // Only register a subscription for a member that actually exists on this
+        // service. Without this guard, an unknown member from untrusted network
+        // input would permanently grow listeners, listener_addrs, and the
+        // interner with no-op subscriptions.
+        let member_exists = self
+            .services
+            .get(&service_sym)
+            .map(|s| s.vars.contains_key(&member_sym))
+            .unwrap_or(false);
+        if !member_exists {
+            return;
+        }
+        if let Some(svc) = self.services.get_mut(&service_sym) {
+            svc.listeners
+                .entry(member_sym)
+                .or_default()
+                .insert((listener_id.clone(), listener_def_sym));
+        } else {
+            return;
+        }
+        self.listener_addrs
+            .insert(listener_id.clone(), reply_to.clone());
+
+        let current = self
+            .services
+            .get(&service_sym)
+            .and_then(|s| s.vars.get(&member_sym))
+            .map(|vs| vs.value.clone());
+        if let Some(value) = current {
+            if let Ok(net_val) = codec::encode_value(&value, &self.interner) {
+                let msg = MeerkatMessage::Update {
+                    listener_service: listener_id.0.clone(),
+                    listener_def: self.interner.get(listener_def_sym).to_string(),
+                    source_service: self.interner.get(service_sym).to_string(),
+                    member: self.interner.get(member_sym).to_string(),
+                    value: net_val,
+                };
+                self.send_oneway(Address::new(&reply_to), msg).await;
+            }
+        }
+    }
+
+    /// #24 listener side: a remote member changed (or its initial value). Cache
+    /// it, recompute the dependent def from cache, and cascade to its listeners.
+    pub async fn handle_update(
+        &mut self,
+        listener_id: ServiceNetId,
+        listener_def_sym: Symbol,
+        source_sym: Symbol,
+        member_sym: Symbol,
+        value: crate::net::ast::NetValue,
+    ) {
+        let value = match codec::decode_value(value, &mut self.interner) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let listener_svc = self
+            .services
+            .iter()
+            .find(|(_, s)| s.id == listener_id)
+            .map(|(name, _)| *name);
+        let listener_svc = match listener_svc {
+            Some(n) => n,
+            None => return,
+        };
+
+        if let Some(svc) = self.services.get_mut(&listener_svc) {
+            svc.dep_cache
+                .entry(listener_def_sym)
+                .or_default()
+                .insert((source_sym, member_sym), value);
+        }
+
+        if self.recompute_def(listener_svc, listener_def_sym).await {
+            self.propagate(listener_svc, listener_def_sym).await;
+        }
+    }
+
     /// Drain all pending network events and dispatch each to the matching
     /// oneshot channel in pending_replies. Non-matching events are dropped.
-    pub fn dispatch_network_events(&mut self) {
-        while let Some(n) = self.network.as_mut() {
-            let event = n.try_recv_event();
+    pub async fn dispatch_network_events(&mut self) {
+        // Scope the network borrow to just the receive (via the inner match) so
+        // the rest of the loop body can take &mut self for the reactive handlers.
+        while let Some(event) = match self.network.as_mut() {
+            Some(n) => n.try_recv_event(),
+            None => None,
+        } {
             match event {
-                Some(NetworkEvent::MessageReceived { msg, .. }) => {
-                    let rid = match &msg {
-                        MeerkatMessage::LookupResponse { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::LookupError { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::Ping { .. }
-                        | MeerkatMessage::Pong { .. }
-                        | MeerkatMessage::Announce { .. }
-                        | MeerkatMessage::Transaction { .. }
-                        | MeerkatMessage::Propagation { .. }
-                        | MeerkatMessage::LookupRequest { .. }
-                        | MeerkatMessage::ActionRequest { .. }
-                        | MeerkatMessage::Commit { .. }
-                        | MeerkatMessage::Abort { .. } => None,
-                    };
-                    if let Some(request_id) = rid {
-                        if let Some(tx) = self.pending_replies.remove(&request_id) {
-                            let _ = tx.send(msg);
+                NetworkEvent::MessageReceived { msg, .. } => match msg {
+                    // #24: reactive messages are not replies; handle them inline
+                    // here in async context rather than buffering them.
+                    MeerkatMessage::RequestUpdates {
+                        service,
+                        member,
+                        listener_service,
+                        listener_def,
+                        reply_to,
+                        ..
+                    } => {
+                        // #24: validate + intern wire names through codec (the
+                        // sole interning authority for network data); skip the
+                        // message if any identifier fails validation.
+                        let (service_sym, member_sym, listener_def_sym) =
+                            match codec::decode_request_updates(
+                                &service,
+                                &member,
+                                &listener_def,
+                                &mut self.interner,
+                            ) {
+                                Ok(syms) => syms,
+                                Err(_) => continue,
+                            };
+                        self.handle_request_updates(
+                            service_sym,
+                            member_sym,
+                            ServiceNetId(listener_service),
+                            listener_def_sym,
+                            reply_to,
+                        )
+                        .await;
+                    }
+                    MeerkatMessage::Update {
+                        listener_service,
+                        listener_def,
+                        source_service,
+                        member,
+                        value,
+                    } => {
+                        // #24: validate + intern wire names through codec; skip
+                        // the message if any identifier fails validation.
+                        let (listener_def_sym, source_sym, member_sym) = match codec::decode_update(
+                            &listener_def,
+                            &source_service,
+                            &member,
+                            &mut self.interner,
+                        ) {
+                            Ok(syms) => syms,
+                            Err(_) => continue,
+                        };
+                        self.handle_update(
+                            ServiceNetId(listener_service),
+                            listener_def_sym,
+                            source_sym,
+                            member_sym,
+                            value,
+                        )
+                        .await;
+                    }
+                    // Everything else is a reply: route it to its waiter.
+                    other => {
+                        let rid = match &other {
+                            MeerkatMessage::LookupResponse { request_id, .. } => Some(*request_id),
+                            MeerkatMessage::LookupError { request_id, .. } => Some(*request_id),
+                            MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
+                            MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
+                            MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
+                            MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
+                            MeerkatMessage::Ping { .. }
+                            | MeerkatMessage::Pong { .. }
+                            | MeerkatMessage::Announce { .. }
+                            | MeerkatMessage::Transaction { .. }
+                            | MeerkatMessage::Propagation { .. }
+                            | MeerkatMessage::LookupRequest { .. }
+                            | MeerkatMessage::ActionRequest { .. }
+                            | MeerkatMessage::Commit { .. }
+                            | MeerkatMessage::Abort { .. }
+                            | MeerkatMessage::RequestUpdates { .. }
+                            | MeerkatMessage::Update { .. } => None,
+                        };
+                        if let Some(request_id) = rid {
+                            if let Some(tx) = self.pending_replies.remove(&request_id) {
+                                let _ = tx.send(other);
+                            }
                         }
                     }
-                }
-                Some(NetworkEvent::SendFailed { .. }) => {}
-                Some(NetworkEvent::PeerConnected { .. }) => {}
-                Some(NetworkEvent::PeerDisconnected { .. }) => {}
-                None => break,
+                },
+                NetworkEvent::SendFailed { .. } => {}
+                NetworkEvent::PeerConnected { .. } => {}
+                NetworkEvent::PeerDisconnected { .. } => {}
             }
         }
     }
@@ -628,7 +983,7 @@ impl Manager {
         tokio::pin!(timeout);
 
         loop {
-            self.dispatch_network_events();
+            self.dispatch_network_events().await;
             tokio::select! {
                 biased;
                 result = &mut rx => {
@@ -830,6 +1185,8 @@ impl Manager {
             | MeerkatMessage::CommitResponse { .. }
             | MeerkatMessage::Abort { .. }
             | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::RequestUpdates { .. }
+            | MeerkatMessage::Update { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to lookup request".to_string(),
             )),
@@ -963,6 +1320,8 @@ impl Manager {
             | MeerkatMessage::CommitResponse { .. }
             | MeerkatMessage::Abort { .. }
             | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::RequestUpdates { .. }
+            | MeerkatMessage::Update { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to action request".to_string(),
             )),
@@ -1392,6 +1751,8 @@ impl Manager {
             | MeerkatMessage::Commit { .. }
             | MeerkatMessage::Abort { .. }
             | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::RequestUpdates { .. }
+            | MeerkatMessage::Update { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to commit".to_string(),
             )),
@@ -1454,6 +1815,263 @@ mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
 
+    // #24: cross_service_deps pulls out exactly the (service, member) symbols
+    // referenced via MemberAccess, and nothing for a purely local expression.
+    #[test]
+    fn test_cross_service_deps_extraction() {
+        let tc = TestContext::new();
+        // z = s1.y + 2  ->  {(s1, y)}
+        let z_expr = Expr::Binop {
+            op: crate::ast::BinOp::Add,
+            expr1: Box::new(Expr::MemberAccess {
+                service_name: tc.s1,
+                member_name: tc.y,
+            }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 2 },
+            }),
+        };
+        assert_eq!(
+            z_expr.cross_service_deps(),
+            std::collections::HashSet::from([(tc.s1, tc.y)])
+        );
+        // y = x + 1  ->  {} (no cross-service references)
+        let y_expr = Expr::Binop {
+            op: crate::ast::BinOp::Add,
+            expr1: Box::new(Expr::Variable { name: tc.x }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 1 },
+            }),
+        };
+        assert!(y_expr.cross_service_deps().is_empty());
+    }
+
+    // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,
+    // driven by the listener cascade rather than a lazy re-lookup.
+    #[tokio::test]
+    async fn test_cross_service_def_updates_eagerly() {
+        let mut tc = TestContext::new();
+        let z = tc.manager.interner.insert("z");
+
+        // service s1 { var x = 1; pub def y = x + 1; }
+        let s1_decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+
+        // service s2 { pub def z = s1.y + 2; }
+        let s2_decls = vec![Decl::DefDecl {
+            name: z,
+            ty: None,
+            val: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service_name: tc.s1,
+                    member_name: tc.y,
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 2 },
+                }),
+            },
+            is_pub: true,
+        }];
+        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+
+        // initial z = (1 + 1) + 2 = 4
+        assert_eq!(
+            tc.manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap()
+                .value,
+            Value::Int { val: 4 }
+        );
+
+        // s2.z is registered as a listener on s1.y
+        let on_y = tc
+            .manager
+            .services
+            .get(&tc.s1)
+            .unwrap()
+            .listeners
+            .get(&tc.y)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            on_y.iter().any(|(_, d)| *d == z),
+            "s2.z should be registered as a listener on s1.y"
+        );
+
+        // s1.x = 4  ->  s1.y = 5  ->  s2.z = 7, eagerly via the cascade
+        tc.manager
+            .assign(tc.s1, tc.x, Value::Int { val: 4 }, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tc.manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap()
+                .value,
+            Value::Int { val: 7 },
+            "s2.z should update eagerly through the cross-service listener cascade"
+        );
+    }
+
+    // #24: handle_update caches a pushed remote value and recomputes the
+    // dependent def FROM THE CACHE, not from a fresh lookup of the local value.
+    #[tokio::test]
+    async fn test_handle_update_recomputes_from_cache() {
+        let mut tc = TestContext::new();
+        let z = tc.manager.interner.insert("z");
+
+        let s1_decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+
+        let s2_decls = vec![Decl::DefDecl {
+            name: z,
+            ty: None,
+            val: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service_name: tc.s1,
+                    member_name: tc.y,
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 2 },
+                }),
+            },
+            is_pub: true,
+        }];
+        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+
+        let s2_id = tc.manager.services.get(&tc.s2).unwrap().id.0.clone();
+        let net_val = codec::encode_value(&Value::Int { val: 10 }, &tc.manager.interner).unwrap();
+
+        // simulate a remote Update saying s1.y = 10
+        let z_sym = tc.manager.interner.insert("z");
+        tc.manager
+            .handle_update(ServiceNetId(s2_id), z_sym, tc.s1, tc.y, net_val)
+            .await;
+
+        // recomputed from the cached 10 (not s1's local y of 2): 10 + 2 = 12
+        assert_eq!(
+            tc.manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap()
+                .value,
+            Value::Int { val: 12 }
+        );
+    }
+
+    // #24: handle_request_updates registers a remote listener and records its
+    // reply address (the initial Update send is a no-op without a network).
+    #[tokio::test]
+    async fn test_handle_request_updates_registers_listener() {
+        let mut tc = TestContext::new();
+        let s1_decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+
+        let z = tc.manager.interner.insert("z");
+        tc.manager
+            .handle_request_updates(
+                tc.s1,
+                tc.y,
+                ServiceNetId("remote-s2-id".to_string()),
+                z,
+                "/ip4/1.2.3.4/tcp/9".to_string(),
+            )
+            .await;
+        let on_y = tc
+            .manager
+            .services
+            .get(&tc.s1)
+            .unwrap()
+            .listeners
+            .get(&tc.y)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            on_y.iter().any(|(id, d)| id.0 == "remote-s2-id" && *d == z),
+            "remote s2.z should be registered as a listener on s1.y"
+        );
+        assert_eq!(
+            tc.manager
+                .listener_addrs
+                .get(&ServiceNetId("remote-s2-id".to_string()))
+                .map(|a| a.as_str()),
+            Some("/ip4/1.2.3.4/tcp/9")
+        );
+    }
     struct TestContext {
         manager: Manager,
         foo: Symbol,

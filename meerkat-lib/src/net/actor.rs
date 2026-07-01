@@ -35,6 +35,9 @@ enum PendingRelayState {
     Listening(Address, Sender<Result<Address, String>>, ListenerId),
 }
 
+// Command payloads intentionally carry a full MeerkatMessage; boxing buys
+// nothing for these short-lived channel messages.
+#[allow(clippy::large_enum_variant)]
 enum SwarmCommand {
     Send {
         id: MessageId,
