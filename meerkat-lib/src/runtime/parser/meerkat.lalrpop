@@ -87,7 +87,10 @@ Stmt: Stmt = {
         Stmt::Test { service_name: i, stmts: astmts }
     },
     "import" <i:Ident> => {
-        Stmt::Import { path: format!("{}.mkt", interner.get(i)), service_name: i }
+        Stmt::Import { path: format!("{}.mkt", interner.get(i)), service_name: i, explicit_path : false }
+    },
+    "import" <i:Ident> "from" <p:"strlit"> => {
+        Stmt::Import { path: p.to_string(), service_name: i, explicit_path : true }
     },
     <a:ActionStmt> => Stmt::ActionStmt(a),
     "watch" <e:Expr> ";" => Stmt::Watch { expr: e },

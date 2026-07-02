@@ -217,29 +217,52 @@ async fn exec_stmt(
                 manager.interner.get(service_name)
             )))
         }
-        Stmt::Import { path, service_name } => {
-            let svc_name_str = manager.interner.get(service_name);
+        Stmt::Import { path, service_name, explicit_path} => {
+            let svc_name_str = manager.interner.get(service_name); 
+            if path.starts_with("http://") || path.starts_with("https://") { 
+                manager.remote_services.insert(
+                service_name,
+                meerkat_lib::net::Address::new(path.as_str()));
+                return Ok(Some(format!(
+                    "Remote service '{}' registered at {}.",
+                    svc_name_str, path
+                )));
+            }
             if let Some(url) = remote_url_map.get(svc_name_str) {
                 manager
                     .remote_services
-                    .insert(service_name, meerkat_lib::net::Address::new(url.as_str()));
+                    .insert(service_name, meerkat_lib::net::Address::new(url.as_str())); 
                 return Ok(Some(format!(
                     "Remote service '{}' registered at {}.",
                     svc_name_str, url
                 )));
             }
-            let import_stmts = parse_file(&path, &mut manager.interner)
+            let import_stmts = parse_file(&path, &mut manager.interner) 
                 .map_err(|e| format!("Import '{}': {}", path, e))?;
-            let mut loaded = Vec::new();
-            for s in import_stmts {
-                if let Stmt::Service { name, decls } = s {
-                    manager.create_service(name, decls).await.map_err(|e| {
-                        format!("Imported service '{}': {}", manager.interner.get(name), e)
-                    })?;
-                    loaded.push(manager.interner.get(name).to_string());
+            if explicit_path {
+                for s in import_stmts {
+                    if let Stmt::Service { name, decls } = s {
+                        if name == service_name {
+                            manager.create_service(name, decls).await.map_err(|e| {
+                                format!("Imported service '{}': {}", manager.interner.get(name), e)
+                            })?;
+                            return Ok(Some(format!("Imported service: {}.", manager.interner.get(service_name))));
+                        }
+                    }
                 }
-            }
-            Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
+                return Err(format!("Service '{}' not found in '{}'", manager.interner.get(service_name), path).into());
+            } else {
+                let mut loaded = Vec::new();
+                for s in import_stmts {  
+                    if let Stmt::Service { name, decls } = s {
+                        manager.create_service(name, decls).await.map_err(|e| {
+                            format!("Imported service '{}': {}", manager.interner.get(name), e)
+                        })?;
+                        loaded.push(manager.interner.get(name).to_string());
+                    }
+                }
+                Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
+            }            
         }
         Stmt::ActionStmt(action_stmt) => {
             let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)
