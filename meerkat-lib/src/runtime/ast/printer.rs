@@ -91,7 +91,11 @@ impl<'a> AstPrinter<'a> {
             Stmt::Connect { path, addr } => {
                 println!("Connect: {{ path: \"{}\", addr: \"{}\" }}", path, addr);
             }
-            Stmt::Import { path, service_name, explicit_path } => {
+            Stmt::Import {
+                path,
+                service_name,
+                explicit_path,
+            } => {
                 let service_name = *service_name;
                 println!(
                     "Import: {{ path: \"{}\", service_name: {}, explicit_path: {} }}",

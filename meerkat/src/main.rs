@@ -669,10 +669,10 @@ async fn run_client(
                     println!("@test({}) passed", manager.interner.get(service_name));
                 }
             }
-            &Stmt::Import { 
+            &Stmt::Import {
                 ref path,
                 service_name,
-                ..
+                explicit_path,
             } => {
                 if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
                     manager
@@ -688,18 +688,39 @@ async fn run_client(
                         .parent()
                         .unwrap_or(std::path::Path::new("."));
                     let import_path = base_dir.join(path);
+
                     let import_stmts =
                         parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
                             .map_err(|e| format!("Import parse error: {}", e))?;
-                    for import_stmt in &import_stmts {
-                        if let &Stmt::Service { name, ref decls } = import_stmt {
-                            manager
-                                .create_service(name, decls.clone())
-                                .await
-                                .map_err(|e| format!("Import service error: {}", e))?;
-                            println!("Imported service '{}'", manager.interner.get(name));
+                    let mut services = import_stmts.into_iter().filter_map(|stmt| match stmt {
+                        Stmt::Service { name, decls } => Some((name, decls)),
+                        _ => None,
+                    });
+                    if explicit_path {
+                        if let Some((name, decls)) =
+                            services.find(|(name, _)| *name == service_name)
+                        {
+                            manager.create_service(name, decls).await.map_err(|e| {
+                                format!("Imported service '{}': {}", manager.interner.get(name), e)
+                            })?;
+                            print!("Imported service: {}.", manager.interner.get(service_name));
+                        } else {
+                            return Err(format!(
+                                "Service '{}' not found in '{}'",
+                                manager.interner.get(service_name),
+                                path
+                            )
+                            .into());
                         }
                     }
+                    let mut loaded = Vec::new();
+                    for (name, decls) in services {
+                        manager.create_service(name, decls).await.map_err(|e| {
+                            format!("Imported service '{}': {}", manager.interner.get(name), e)
+                        })?;
+                        loaded.push(manager.interner.get(name).to_string());
+                    }
+                    print!("Imported service(s): {}.", loaded.join(", "));
                 }
             }
             &Stmt::ActionStmt(_) => {}
